@@ -10,18 +10,24 @@
 
 Both POST bodies are read with ``parse_json_body``, so they work without a Content-Type header.
 
-Plug-in relay: the endpoint stores the vehicle parameters in ``registry.pending_plugins`` together
-with a future in ``registry.session_waiters``, then sends the charge point an OCPP DataTransfer
-(vendor "GreenCharge", message "SimPlugIn"). The simulated charge point answers it and runs
-StatusNotification(Preparing) -> StartTransaction -> StatusNotification(Charging). The CSMS
-StartTransaction handler creates the Session from the pending parameters and resolves the future
-with its id. No meter values are written here; they only ever come from the charge point's
-MeterValues messages.
+Plug-in relay: ``perform_plug_in()`` stores the vehicle parameters in ``registry.pending_plugins``
+together with a future in ``registry.session_waiters``, then sends the charge point an OCPP
+DataTransfer (vendor "GreenCharge", message "SimPlugIn"). The simulated charge point answers it
+and runs StatusNotification(Preparing) -> StartTransaction -> StatusNotification(Charging). The
+CSMS StartTransaction handler creates the Session from the pending parameters and resolves the
+future with its id. No meter values are written here; they only ever come from the charge
+point's MeterValues messages.
+
+``perform_plug_in(req)`` is the whole plug-in, callable without HTTP (the demo scenarios in
+``app.scenarios`` use it). It raises ``PlugInError(status_code, detail)`` for every expected
+failure; the endpoint turns that into the matching HTTP error. The charger helpers below raise
+it too, and the set-limit endpoint, which shares them, maps it the same way.
 
 Expected failures map to HTTP errors, never to a 500:
   404  unknown charger or vehicle model
   409  charger not connected, busy (active session, plug-in in progress, or the charge point
-       refused), no active session to limit, or the charge point disconnected during the call
+       refused), no active session to limit, or the charge point disconnected during the call;
+       also a plug-in cut short by POST /api/demo/reset
   422  invalid body
   502  the charge point answered with an OCPP error, an unexpected status, or the call failed
   504  the charge point did not answer in time, or no StartTransaction arrived in time
@@ -62,27 +68,62 @@ SESSION_POLL_INTERVAL_S = 0.25  # set-limit: how often to look for that session 
 SESSION_ACTIVE = "active"  # Session.status of a session still in progress
 
 
+class PlugInError(Exception):
+    """An expected failure of ``perform_plug_in()``: the HTTP status code and the detail message
+    the plug-in endpoint answers with (codes in the module docstring).
+
+    The charger helpers of this module raise it as well, so the set-limit endpoint, which shares
+    them, maps it to its HTTP error the same way.
+    """
+
+    def __init__(self, status_code: int, detail: str) -> None:
+        super().__init__(status_code, detail)
+        self.status_code = status_code
+        self.detail = detail
+
+    def __str__(self) -> str:
+        return self.detail
+
+    def http_detail(self) -> Any:
+        """The ``detail`` of the HTTP error response."""
+        return self.detail
+
+
+class _FieldValueError(PlugInError):
+    """HTTP 422 for a body field that passed the schema but still cannot be used. Its HTTP detail
+    has the shape of FastAPI's validation errors, like every other 422 of these endpoints."""
+
+    def __init__(self, field: str, value: Any, message: str) -> None:
+        super().__init__(422, f"Value error, {message}")
+        self.field = field
+        self.value = value
+
+    def http_detail(self) -> list[dict[str, Any]]:
+        return [{"type": "value_error", "loc": [self.field], "msg": self.detail, "input": self.value}]
+
+
+def _http_error(exc: PlugInError) -> HTTPException:
+    return HTTPException(status_code=exc.status_code, detail=exc.http_detail())
+
+
 def _charger_label(charger: Charger) -> str:
     return f"Charger {charger.id} ({charger.ocpp_id})"
 
 
 def _load_charger(charger_id: int) -> Charger:
-    """The charger row, or HTTP 404."""
+    """The charger row, or PlugInError 404."""
     with SessionLocal() as db:
         charger = db.get(Charger, charger_id)
     if charger is None:
-        raise HTTPException(status_code=404, detail=f"Charger {charger_id} not found")
+        raise PlugInError(404, f"Charger {charger_id} not found")
     return charger
 
 
 def _connection(charger: Charger) -> registry.ChargePointConnection:
-    """The charger's live OCPP connection, or HTTP 409 when it is not connected."""
+    """The charger's live OCPP connection, or PlugInError 409 when it is not connected."""
     conn = registry.get(charger.ocpp_id)
     if conn is None:
-        raise HTTPException(
-            status_code=409,
-            detail=f"{_charger_label(charger)} is not connected to the CSMS",
-        )
+        raise PlugInError(409, f"{_charger_label(charger)} is not connected to the CSMS")
     return conn
 
 
@@ -122,7 +163,7 @@ async def _call_charge_point(
     Those methods do not raise; when the charge point gave no status they return
     ``STATUS_TIMEOUT``, ``STATUS_CALL_ERROR`` or ``STATUS_ERROR`` (the call could not be made,
     e.g. the connection closed). Without ``timeout_s`` the connection's response timeout
-    applies. Failures become HTTP errors: no answer in time -> 504; charger disconnected -> 409;
+    applies. Failures raise PlugInError: no answer in time -> 504; charger disconnected -> 409;
     a CALLERROR answer or any other failure -> 502.
     """
     ocpp_id = conn.ocpp_id
@@ -130,37 +171,23 @@ async def _call_charge_point(
         result = await (call if timeout_s is None else asyncio.wait_for(call, timeout_s))
     except TimeoutError as exc:  # asyncio.TimeoutError is TimeoutError on Python 3.11
         waited = "in time" if timeout_s is None else f"within {timeout_s:g} s"
-        raise HTTPException(
-            status_code=504, detail=f"Charger {ocpp_id} did not answer {action} {waited}"
-        ) from exc
+        raise PlugInError(504, f"Charger {ocpp_id} did not answer {action} {waited}") from exc
     except ConnectionClosed as exc:
-        raise HTTPException(
-            status_code=409, detail=f"Charger {ocpp_id} disconnected during {action}"
-        ) from exc
+        raise PlugInError(409, f"Charger {ocpp_id} disconnected during {action}") from exc
     except Exception as exc:
         logger.exception("%s to charger %s failed", action, ocpp_id)
-        raise HTTPException(
-            status_code=502, detail=f"{action} to charger {ocpp_id} failed: {exc}"
-        ) from exc
+        raise PlugInError(502, f"{action} to charger {ocpp_id} failed: {exc}") from exc
     # Status enums are StrEnums; compare and report the plain value.
     status = str(getattr(result, "value", result))
     if status == STATUS_TIMEOUT:
-        raise HTTPException(
-            status_code=504, detail=f"Charger {ocpp_id} did not answer {action} in time"
-        )
+        raise PlugInError(504, f"Charger {ocpp_id} did not answer {action} in time")
     if status == STATUS_CALL_ERROR or result is None:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Charger {ocpp_id} answered {action} with an OCPP CALLERROR",
-        )
+        raise PlugInError(502, f"Charger {ocpp_id} answered {action} with an OCPP CALLERROR")
     if status == STATUS_ERROR:
         if registry.get(ocpp_id) is not conn:
-            raise HTTPException(
-                status_code=409, detail=f"Charger {ocpp_id} disconnected during {action}"
-            )
-        raise HTTPException(
-            status_code=502,
-            detail=f"{action} to charger {ocpp_id} could not be made (details in the server log)",
+            raise PlugInError(409, f"Charger {ocpp_id} disconnected during {action}")
+        raise PlugInError(
+            502, f"{action} to charger {ocpp_id} could not be made (details in the server log)"
         )
     return status
 
@@ -168,55 +195,57 @@ async def _call_charge_point(
 @router.post("/debug/plug-in")
 async def plug_in(request: Request) -> dict[str, Any]:
     body = await parse_json_body(request, PlugInRequest)
+    try:
+        return await perform_plug_in(body)
+    except PlugInError as exc:
+        raise _http_error(exc) from None
 
-    vehicle = get_vehicle(body.vehicle_model)
+
+async def perform_plug_in(req: PlugInRequest) -> dict[str, Any]:
+    """Plug the car described by ``req`` into its charger; return once the charge point's
+    StartTransaction has created the Session:
+    ``{"session_id", "transaction_id", "charger_id", "ocpp_id"}``.
+
+    Raises ``PlugInError`` for every expected failure (see the module docstring). Must run on the
+    event loop the CSMS runs on.
+    """
+    vehicle = get_vehicle(req.vehicle_model)
     if vehicle is None:
         known = ", ".join(v["model"] for v in load_vehicles())
-        raise HTTPException(
-            status_code=404,
-            detail=f"Unknown vehicle_model {body.vehicle_model!r}; known models: {known}",
+        raise PlugInError(
+            404, f"Unknown vehicle_model {req.vehicle_model!r}; known models: {known}"
         )
     try:
         # The CSMS computes deadline = plug-in time + hours_until_departure (simulated hours).
-        clock.now() + timedelta(hours=body.hours_until_departure)
+        clock.now() + timedelta(hours=req.hours_until_departure)
     except OverflowError:
-        raise HTTPException(
-            status_code=422,
-            detail=[
-                {
-                    "type": "value_error",
-                    "loc": ["hours_until_departure"],
-                    "msg": "Value error, the departure time is beyond the representable date range",
-                    "input": body.hours_until_departure,
-                }
-            ],
+        raise _FieldValueError(
+            "hours_until_departure",
+            req.hours_until_departure,
+            "the departure time is beyond the representable date range",
         ) from None
 
-    charger = _load_charger(body.charger_id)
+    charger = _load_charger(req.charger_id)
     conn = _connection(charger)
     ocpp_id = charger.ocpp_id
 
     active = _active_session(charger.id)
     if active is not None:
-        raise HTTPException(
-            status_code=409,
-            detail=f"{_charger_label(charger)} already has active session {active.id}",
+        raise PlugInError(
+            409, f"{_charger_label(charger)} already has active session {active.id}"
         )
     # No await between this check and registering the pending plug-in below, so two concurrent
     # requests for one charger cannot both get past it.
     if ocpp_id in registry.pending_plugins or ocpp_id in registry.session_waiters:
-        raise HTTPException(
-            status_code=409,
-            detail=f"A plug-in is already in progress on {_charger_label(charger)}",
-        )
+        raise PlugInError(409, f"A plug-in is already in progress on {_charger_label(charger)}")
 
     params = {
         "vehicle_model": vehicle["model"],
         "battery_kwh": float(vehicle["battery_kwh"]),
         "max_kw": min(float(vehicle["max_ac_kw"]), float(charger.max_power_kw)),
-        "soc_start": body.soc_start,
-        "soc_target": body.soc_target,
-        "hours_until_departure": body.hours_until_departure,
+        "soc_start": req.soc_start,
+        "soc_target": req.soc_target,
+        "hours_until_departure": req.hours_until_departure,
     }
     loop = asyncio.get_running_loop()
     waiter: asyncio.Future = loop.create_future()
@@ -231,30 +260,27 @@ async def plug_in(request: Request) -> dict[str, Any]:
             timeout_s=PLUG_IN_TIMEOUT_S,
         )
         if status == DataTransferStatus.rejected:
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    f"{_charger_label(charger)} rejected the plug-in (status {status!r}); "
-                    "the simulated charge point does this while a car is already plugged in"
-                ),
+            raise PlugInError(
+                409,
+                f"{_charger_label(charger)} rejected the plug-in (status {status!r}); "
+                "the simulated charge point does this while a car is already plugged in",
             )
         if status != DataTransferStatus.accepted:
-            raise HTTPException(
-                status_code=502,
-                detail=f"{_charger_label(charger)} answered the plug-in DataTransfer with status {status!r}",
+            raise PlugInError(
+                502,
+                f"{_charger_label(charger)} answered the plug-in DataTransfer with status {status!r}",
             )
         try:
             # shield: a timeout here must not cancel the future the CSMS handler may resolve.
+            # A demo reset fails the future with a PlugInError, which propagates from here.
             session_id = await asyncio.wait_for(
                 asyncio.shield(waiter), timeout=max(0.0, deadline - loop.time())
             )
         except TimeoutError:
-            raise HTTPException(
-                status_code=504,
-                detail=(
-                    f"{_charger_label(charger)} accepted the plug-in but no StartTransaction "
-                    f"created a session within {PLUG_IN_TIMEOUT_S:g} s"
-                ),
+            raise PlugInError(
+                504,
+                f"{_charger_label(charger)} accepted the plug-in but no StartTransaction "
+                f"created a session within {PLUG_IN_TIMEOUT_S:g} s",
             ) from None
     finally:
         # Whatever happened, this request's plug-in is no longer pending. The StartTransaction
@@ -282,7 +308,13 @@ async def plug_in(request: Request) -> dict[str, Any]:
 @router.post("/debug/set-limit")
 async def set_limit(request: Request) -> dict[str, Any]:
     body = await parse_json_body(request, SetLimitRequest)
+    try:
+        return await _set_limit(body)
+    except PlugInError as exc:  # raised by the shared charger helpers
+        raise _http_error(exc) from None
 
+
+async def _set_limit(body: SetLimitRequest) -> dict[str, Any]:
     charger = _load_charger(body.charger_id)
     _connection(charger)  # fail fast when the charger is offline
     session = await _wait_for_active_session(charger.id, SET_LIMIT_SESSION_WAIT_S)

@@ -6,9 +6,11 @@ specification (`BUILD_SPEC.md`, the single source of truth, kept outside this di
 starts only after the previous phase's acceptance test passes. So far it has Phase 0 (a running
 skeleton), Phase 1 (the data layer: database schema, seed data, and grid carbon-intensity, tariff
 and site data over HTTP), Phase 2 (the OCPP layer: an OCPP 1.6J server inside the API process and
-six simulated chargers that obey remote power limits) and Phase 3 (the optimizer: a linear program
-that plans each car's charging power for the next 24 hours). The optimizer is not yet run on live
-sessions, and there is no dashboard yet.
+six simulated chargers that obey remote power limits), Phase 3 (the optimizer: a linear program
+that plans each car's charging power for the next 24 hours) and Phase 4 (orchestration: a control
+loop that runs the optimizer on the live sessions, pushes the result to the chargers as OCPP
+charging profiles, and accounts for the CO₂ and money saved against a naive-charging baseline).
+There is no dashboard yet; everything is driven over the API.
 
 ## Prerequisites
 
@@ -245,6 +247,113 @@ cannot start and `optimize` fails with an `OSError`. The first CBC run after ins
 takes about a second longer while macOS checks and translates the binary; later solves take tens
 of milliseconds.
 
+## Orchestration (Phase 4)
+
+The orchestrator (`backend/app/orchestrator/`) turns the optimizer into a live control loop: it
+plans every active session, executes the plan through OCPP, and keeps the books on what that
+saved. It starts and stops with the API process, alongside the CSMS.
+
+**The tick — model predictive control.** A tick runs every 5 **simulated** minutes
+(`settings.tick_minutes`), which is `5 × 60 / TIME_SCALE` real seconds — 5 real seconds at the
+default `TIME_SCALE=60` — driven by an APScheduler `AsyncIOScheduler`. Each tick:
+
+1. loads every `active` session with its charger and site;
+2. computes `energy_needed = max(0, (soc_target − soc_current) × battery_kwh)` and the power
+   ceiling `acceptance_kw(soc_current, max_charge_kw)` — what the car will take right now;
+3. builds each session's `available` mask over the 96-slot horizon that starts at the current
+   15-minute slot: the current slot counts while `now < deadline`, a later slot only if it ends by
+   the deadline, and a charger reporting `Faulted` is unavailable in every slot;
+4. fetches the carbon forecast for the site's grid zone and the tariff, resampled to the 96 slots;
+5. calls `optimize()` in a worker thread, once per site;
+6. writes all 96 planned slots per session to the `schedules` table — a new version every tick,
+   older versions kept, because the history is a demo asset;
+7. sends each charge point `SetChargingProfile` with **slot 0 only**, as a whole number of watts;
+8. logs one line: reason, sessions, solve status, solve time, planned slot-0 power, profiles
+   accepted.
+
+**Only slot 0 is ever executed.** The other 95 slots are a plan that the next tick revises with
+newer SoC, newer forecast and newer cars. Ticks never overlap (one `asyncio.Lock`), and besides
+the timer a tick is requested immediately after a StartTransaction (once its baseline is stored),
+after a StopTransaction, on a `Faulted` status, when a charge point turns out to have lost a
+transaction, on an override, and on a weights change (that one is awaited, so the caller sees the
+new plan). A failed tick is logged and the chargers simply keep their last limits.
+
+**Manual limits.** A session with a manual limit — `POST /api/sessions/{id}/override` or the
+Phase 2 `POST /api/debug/set-limit` — is taken out of the linear program. What it actually draws
+(the lower of its limit and its acceptance now) is subtracted from the site limit the LP has to
+share out, its own limit is re-sent every tick, and a "max now" plan is stored for it so the UI can
+draw it like any other session. Its limit is dropped when the session stops.
+
+**Baseline shadow simulation** (`orchestrator/baseline.py`). When a session starts, the same
+battery physics the simulator uses answer the counterfactual: *what if this car had charged at its
+full acceptance rate from the moment it was plugged in, with no site limit and no coordination?*
+The resulting power profile is priced with the carbon forecast and the tariff and stored once as
+`co2_baseline_g` and `cost_baseline_inr`. The baseline never sends an OCPP message; it is a
+simulation, not a second controller. Every savings number in the product comes from it.
+
+**Honest accounting** (`orchestrator/accounting.py`). Actual CO₂ and cost are attributed per meter
+interval, as the energy arrives: for each `MeterValues` reading (and for the final `meterStop` of a
+`StopTransaction`), `co2_actual_g += Δenergy × CI` and `cost_actual_inr += Δenergy × price`, where
+`CI` is the **actual** carbon intensity at that moment in the charger's site grid zone — never the
+forecast — and `price` is the tariff at that moment. A negative delta (a meter register reset) is
+ignored, and if the carbon intensity or the price cannot be obtained the reading is still stored
+and the unattributed kWh are logged rather than guessed. (With the default synthetic provider the
+actual and forecast carbon intensities come from the same deterministic profile, so they agree by
+construction; the code paths are still separate, and only a real provider would show the gap.)
+
+**Impact summary** (`GET /api/impact/summary`) totals the non-aborted sessions:
+
+- a **completed** session saved `baseline − actual`, and is on time when its final SoC reached its
+  target (within `settings.soc_tolerance`);
+- an **active** session saved `baseline − (actual so far + its remaining planned slots priced with
+  the forecast)`, and is on time when the last tick left it no unmet energy.
+
+**Load curve** (`GET /api/sites/{id}/load-curve`) is 96 slots from the site's earliest non-aborted
+plug-in. `baseline_kw` is the sum of every session's naive profile. `optimized_kw` is measured for
+slots that have already ended — the mean metered power of each session in that slot — and planned
+for the current and later slots. Both peaks are returned, which is what shows that the coordinated
+load stays under the site limit while the naive one would not.
+
+### Endpoints
+
+| Endpoint | What it gives |
+|---|---|
+| `GET /api/sessions/active` | every active session's columns plus `ocpp_id`, `manual_limit_w`, `projected_unmet_kwh`, `on_time` and its latest 96-slot schedule |
+| `GET /api/sessions/{id}/schedule` | `{session_id, computed_at, slots: [{slot_start, power_kw} × 96]}`; 404 if that session has no plan yet |
+| `POST /api/sessions/{id}/override` | charge at the car's maximum now: records the manual limit, sends the profile immediately and re-ticks → `{session_id, limit_w, status}`. 404 unknown, 409 not active or the charger is not connected or rejected it |
+| `GET /api/sites/{id}/load-curve` | optimized vs baseline kW over 96 slots, both peaks and the site limit |
+| `GET /api/impact/summary` | exactly `{co2_saved_kg, cost_saved_inr, sessions_on_time, total_sessions}` |
+| `POST /api/optimizer/weights` | `{"alpha" ≥ 0, "beta" ≥ 0}` → sets the weights, re-ticks at once and returns `{alpha, beta, tick}` |
+| `POST /api/demo/reset` | stops every live transaction (`RemoteStopTransaction`, up to 3 s), truncates `meter_values`, `schedules` and `sessions` with `RESTART IDENTITY`, clears the in-memory limits and the orchestrator state. Sites, chargers and cached grid data survive |
+| `POST /api/demo/scenario/{name}` | runs a scenario in the background (409 if one is running, 404 unknown) |
+| `GET /api/demo/status` | `{scenario, running, step, total_steps, events, error}` for the scenario |
+
+As in Phase 2, every POST reads its body as JSON whatever the Content-Type says, so `curl -X POST`
+works without `-H`. A missing carbon forecast for an active session's zone returns 503.
+
+### Demo scenario
+
+`evening_rush` is the headline scenario: the demo state is reset, the simulation clock is set to
+today 18:30 IST, and six cars — the six `vehicles.json` models on CP001…CP006 — plug in nine
+simulated minutes apart (18:30 to 19:15), all leaving at 07:00 the next morning.
+
+```bash
+python scripts/demo_scenario.py --scenario evening_rush
+sleep 30
+curl -s localhost:8000/api/impact/summary
+```
+
+The script needs only the standard library, so any Python 3 runs it. It starts the scenario, polls
+`/api/demo/status` once a second, prints each plug-in as it happens, and finishes by printing each
+site's baseline and optimized peak. It exits 1 if any plug-in fails. The API, the seeded database
+and `python simulator/run.py --chargers 6` must all be running.
+
+At `TIME_SCALE=60` the scenario spans about 45 real seconds. What it shows: a **baseline peak of
+46.8 kW** (all six cars at full AC power at once) against the **40 kW site limit**, an **optimized
+peak of 40.0 kW** that never crosses it, all the charging moved into the 00:00–05:00 IST window
+where the carbon intensity is lowest, and about 11–12 kg of CO₂ and about ₹200 saved across the
+six cars, with every car still reaching 80 % before 07:00.
+
 ## Decisions & deviations
 
 Decisions (2026-09-11) that refine or deviate from the spec, and known limitations:
@@ -313,10 +422,53 @@ Phase 2 (OCPP layer):
   it; meter values stay in arrival order, so `tail -1` is still the newest reading.
 - **Sessions left `active`.** If a charger never sends StopTransaction, for example because the
   simulator was restarted in the middle of a session, that session stays `active`, and plug-in on
-  that charger answers 409 until it is cleared. To start clean, stop the API and the simulator,
-  then empty the sessions. This also empties `meter_values` and `schedules` and restarts session ids
-  at 1:
+  that charger answers 409 until it is cleared. From Phase 4 the way to start clean is
+  `curl -X POST localhost:8000/api/demo/reset`, which stops the live transactions first. Without the
+  API running, empty the tables by hand (this also empties `meter_values` and `schedules` and
+  restarts session ids at 1):
   `docker compose exec postgres psql -U greencharge -d greencharge -c "TRUNCATE sessions RESTART IDENTITY CASCADE;"`
+
+Phase 4 (orchestration):
+
+- **Extra files** (user-approved): `backend/app/routers/impact.py` (`/api/impact/summary` and
+  `/api/optimizer/weights`), `backend/app/routers/demo.py` (the reset and scenario endpoints),
+  `backend/app/scenarios.py` (the scenario definitions, the runner and the reset) and
+  `scripts/demo_scenario.py`. The spec's Phase 4 manifest lists only `backend/app/orchestrator/`,
+  but its acceptance test runs `scripts/demo_scenario.py`, which needs a scenario to run.
+  `backend/app/routers/debug.py` was refactored so the scenarios can reuse the plug-in without
+  going through HTTP; both debug endpoints behave exactly as before.
+- **Known limitation of the MPC tick.** Slot 0 is the *current* slot, which is already partly
+  elapsed, but the linear program credits it with a full 15 minutes, so a plan can promise slightly
+  more energy in the current slot than the car can still take in it. The plan is rebuilt every tick,
+  so the error is corrected long before it matters; it only shows up in plans that are tight right
+  at the deadline. This is deliberately **not** fixed by changing the model — a partial first slot
+  would complicate every constraint for a rounding-scale gain.
+- **Savings for a session in progress are an estimate.** An active session is credited with its
+  baseline minus (what it has actually used plus what it still plans to use, priced with the
+  forecast). Energy that is planned but never delivered — a charger that faults, a plan the solver
+  had to relax — therefore shows as saving until the session ends. Completed sessions are measured,
+  not estimated.
+- **The load curve counts only active sessions in the future.** For slots that have not ended, the
+  optimized line sums the latest plan of the sessions that are still `active`. A completed session's
+  last plan is left out, because that car has gone; it is already represented by its metered power in
+  the slots that have ended.
+- **Past slots on the load curve are sampled, not integrated.** A past slot's optimized value is the
+  mean of the meter readings inside it. At `TIME_SCALE=60` a 15-minute slot holds only one or two
+  readings per car, so the line approximates the slot's average power and the optimized peak can
+  read a little above the site limit even though no instant exceeded it. The plan itself (and every
+  limit actually sent) always respects the limit.
+- **`StatusNotification(Available)` aborts a lost session only on a real connector.** A charge point
+  reporting `Available` on connector 1 while a session is still active has lost that transaction (the
+  simulator restarted, say), so the session is marked `aborted`. Connector 0 is excluded: in OCPP 1.6
+  it reports the charge point's main controller, not a connector, so it says nothing about a
+  transaction. The simulator only ever uses connector 1.
+- **The load-curve window starts at the earliest non-aborted plug-in** of the site and is 96 slots
+  long, as specified. A session older than 24 hours that was never stopped therefore pushes "now"
+  off the right-hand edge of the chart. `POST /api/demo/reset` (which every scenario runs first)
+  clears it.
+- **One WARNING burst is expected right after a reset.** A tick that was already in flight when the
+  reset stopped the transactions still sends its (0 W) profiles, and the chargers answer `Rejected`
+  because their transactions have just ended. It is logged and harmless.
 
 ## Phase status
 
@@ -324,3 +476,6 @@ Phase 2 (OCPP layer):
 - Phase 1 — Data layer: acceptance passed (forecast has 96 slots with a 291 g/kWh spread; 6 chargers)
 - Phase 2 — OCPP layer: acceptance passed (6 chargers connected; a remote 5000 W SetChargingProfile throttles the car from 7.2 kW to 5.0 kW)
 - Phase 3 — Optimizer: acceptance passed (3/3 fixtures; site-constrained solve ≈ 25 ms against the 2 s limit)
+- Phase 4 — Orchestration: acceptance passed (`evening_rush`: 11.86 kg CO₂ saved, ₹201 saved, 6/6
+  sessions on time, optimized peak 40.0 kW against a baseline peak of 46.8 kW and a 40 kW site limit;
+  the commanded limit is 0 W through the evening peak and the energy lands in 00:00–05:00)

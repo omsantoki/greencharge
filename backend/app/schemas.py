@@ -2,10 +2,10 @@
 
 Datetimes are timezone-aware UTC and serialise as ISO-8601 with an offset.
 """
-from datetime import datetime
-from typing import Self
+from datetime import datetime, timezone
+from typing import Annotated, Self
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, model_validator
 
 
 class CarbonPointOut(BaseModel):
@@ -74,3 +74,107 @@ class SetLimitRequest(BaseModel):
 
     charger_id: int
     limit_w: float = Field(ge=0.0, allow_inf_nan=False)  # watts
+
+
+# Phase 4 orchestration endpoints. Their response models fix the exact shapes of the
+# implementation contract (6b), so a response never carries a key the contract does not name.
+
+
+def _as_utc(value: datetime) -> datetime:
+    """The same instant in UTC. A naive datetime is rejected: its instant is unknown."""
+    if value.tzinfo is None or value.tzinfo.utcoffset(value) is None:
+        raise ValueError("datetime must be timezone-aware")
+    return value.astimezone(timezone.utc)
+
+
+# A datetime served as UTC, whatever offset the database or the orchestrator handed over.
+UtcDatetime = Annotated[datetime, AfterValidator(_as_utc)]
+
+
+class ScheduleSlotOut(BaseModel):
+    """One 15-minute slot of a session's planned charging power."""
+
+    slot_start: UtcDatetime
+    power_kw: float
+
+
+class ActiveSessionOut(BaseModel):
+    """GET /api/sessions/active: every Session column plus the session's orchestration state."""
+
+    # models.Session columns
+    id: int
+    charger_id: int
+    ocpp_transaction_id: int | None
+    vehicle_model: str
+    battery_kwh: float
+    max_charge_kw: float
+    soc_start: float
+    soc_target: float
+    soc_current: float
+    plugged_in_at: UtcDatetime
+    deadline: UtcDatetime
+    energy_delivered_kwh: float
+    co2_actual_g: float
+    co2_baseline_g: float
+    cost_actual_inr: float
+    cost_baseline_inr: float
+    status: str
+    # orchestration state
+    ocpp_id: str
+    manual_limit_w: float | None  # operator limit (override or debug set-limit), W
+    projected_unmet_kwh: float | None  # the last tick's unmet energy; None if it had none
+    on_time: bool  # the last tick left no unmet energy for this session
+    schedule: list[ScheduleSlotOut]  # the latest plan, 96 slots; [] before the first plan
+
+
+class SessionScheduleOut(BaseModel):
+    """GET /api/sessions/{id}/schedule: the session's latest plan."""
+
+    session_id: int
+    computed_at: UtcDatetime
+    slots: list[ScheduleSlotOut]
+
+
+class LoadCurveSlotOut(BaseModel):
+    slot_start: UtcDatetime
+    optimized_kw: float  # measured (is_past) or planned aggregate site power
+    baseline_kw: float  # the naive shadow simulation's aggregate site power
+    is_past: bool
+
+
+class LoadCurveOut(BaseModel):
+    """GET /api/sites/{id}/load-curve: optimized vs baseline aggregate kW, 96 slots."""
+
+    site_id: int
+    max_power_kw: float
+    window_start: UtcDatetime
+    now: UtcDatetime
+    slots: list[LoadCurveSlotOut]
+    optimized_peak_kw: float
+    baseline_peak_kw: float
+
+
+class ImpactSummaryOut(BaseModel):
+    """GET /api/impact/summary: exactly the four keys of the build spec."""
+
+    co2_saved_kg: float
+    cost_saved_inr: float
+    sessions_on_time: int
+    total_sessions: int
+
+
+class WeightsRequest(BaseModel):
+    """POST /api/optimizer/weights: the objective weights (alpha: carbon, beta: cost).
+
+    Non-finite values are refused: the optimizer rejects them.
+    """
+
+    alpha: float = Field(ge=0.0, allow_inf_nan=False)
+    beta: float = Field(ge=0.0, allow_inf_nan=False)
+
+
+class OverrideRequest(BaseModel):
+    """POST /api/sessions/{id}/override takes no parameters (the session is in the path).
+
+    The body may be empty or a JSON object; any keys in it are ignored.
+    """

@@ -8,6 +8,12 @@
   created and stops it at shutdown; if it cannot bind its port the error is logged and the HTTP
   API keeps running without it. Routers: debug/operator endpoints (`app.routers.debug`) and
   session meter values (`app.routers.sessions`).
+- Phase 4 orchestration: the tick scheduler (APScheduler, `app.orchestrator.loop`) starts after
+  the CSMS, on the same event loop, and stops before it at shutdown. If it cannot start, the
+  error is logged and the API keeps running without periodic ticks. Routers: active sessions,
+  plans and override (`app.routers.sessions`), the site load curve (`app.routers.sites`), the
+  impact summary and optimizer weights (`app.routers.impact`) and the demo controls
+  (`app.routers.demo`).
 
 Tables are created idempotently at startup.
 """
@@ -21,7 +27,8 @@ from fastapi import FastAPI
 from app.config import settings
 from app.db import Base, db_ok, engine
 from app.ocpp.csms import start_csms, stop_csms
-from app.routers import debug, grid, sessions, sites
+from app.orchestrator.loop import start_scheduler, stop_scheduler
+from app.routers import debug, demo, grid, impact, sessions, sites
 
 logger = logging.getLogger("greencharge.main")
 
@@ -60,9 +67,25 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
             "OCPP CSMS could not listen on port %d, the HTTP API keeps running without it: %s",
             settings.ocpp_port, exc,
         )
+
+    # The orchestrator tick scheduler, started after the CSMS it sends charging profiles through.
+    scheduler = None
+    try:
+        scheduler = start_scheduler()
+    except Exception:
+        logger.exception(
+            "Orchestrator scheduler could not start, the HTTP API keeps running without "
+            "periodic ticks"
+        )
     try:
         yield
     finally:
+        # Stop ticking before the CSMS goes away, so no tick sends to a closing connection.
+        if scheduler is not None:
+            try:
+                stop_scheduler(scheduler)
+            except Exception:
+                logger.exception("Error while stopping the orchestrator scheduler")
         if csms_server is not None:
             try:
                 await stop_csms(csms_server)
@@ -75,6 +98,8 @@ app.include_router(grid.router)
 app.include_router(sites.router)
 app.include_router(debug.router)
 app.include_router(sessions.router)
+app.include_router(impact.router)
+app.include_router(demo.router)
 
 
 def redis_ok() -> bool:

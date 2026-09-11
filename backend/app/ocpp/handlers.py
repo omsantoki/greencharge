@@ -8,18 +8,28 @@ Inbound (CP -> CSMS), one ``@on`` handler each:
 
     BootNotification    Accepted, interval = settings.heartbeat_interval_s, current time.
     Heartbeat           chargers.last_heartbeat = now; replies with the current time.
-    StatusNotification  chargers.status = the reported status.
+    StatusNotification  chargers.status = the reported status. Then (Phase 4): "Faulted" asks
+                        the orchestrator for a re-plan; "Available" on a connector while the
+                        charger still has an active session means the charge point has lost that
+                        transaction (e.g. the simulator restarted), so the session becomes
+                        "aborted", its manual limit is dropped and a re-plan is requested. After
+                        a normal StopTransaction the session is already completed, so the CP's
+                        Finishing -> Available changes nothing.
     StartTransaction    Creates the Session from the plug-in parameters the API left in
                         ``registry.pending_plugins``; transaction id = Session.id (also stored in
                         ``ocpp_transaction_id``). With no pending parameters the reply is
                         idTagInfo "Invalid" with transaction id 0, and the CP must not charge.
                         ``registry.session_waiters`` is resolved with the session id once the
                         reply has been SENT (``@after`` hook), so the charge point knows its
-                        transaction id before anyone can act on the new session.
+                        transaction id before anyone can act on the new session. That hook then
+                        starts the orchestrator's ``on_session_started`` (baseline, re-plan) in a
+                        task of its own.
     MeterValues         Writes one MeterValue row and updates the session's energy_delivered_kwh
-                        and soc_current (see "MeterValues" below).
-    StopTransaction     Session status "completed", energy_delivered_kwh = meterStop / 1000, and
-                        the session's entry in ``registry.manual_limits_w`` is dropped.
+                        and soc_current (see "MeterValues" below), after attributing the energy
+                        since the previous reading (see "Accounting" below).
+    StopTransaction     Attributes the last interval, then session status "completed",
+                        energy_delivered_kwh = meterStop / 1000, and the session's entry in
+                        ``registry.manual_limits_w`` is dropped; then a re-plan is requested.
 
 Outbound (CSMS -> CP): ``set_charging_profile``, ``remote_stop``, ``send_plug_in``. Each returns
 the status string the charge point answered ("Accepted", "Rejected", ...), or "CallError" (the
@@ -36,10 +46,10 @@ Rules this module follows:
   helpers below must not be awaited from inside an ``@on`` handler for the same reason.
 - Time: every timestamp written to the database is ``clock.now()`` (the simulation clock), read
   when the message is received. Timestamps sent by the charge point are logged, never stored.
-- Database: each handler runs one short transaction in its own ``SessionLocal()``, in a worker
-  thread (``asyncio.to_thread``) so a slow or unreachable database never stalls the event loop
-  that also serves the API and the other charge points. The in-memory registry and asyncio
-  futures are only touched on the event-loop thread.
+- Database: each piece of database work is one short transaction in its own ``SessionLocal()``,
+  in a worker thread (``asyncio.to_thread``) so a slow or unreachable database never stalls the
+  event loop that also serves the API and the other charge points. The in-memory registry and
+  asyncio futures are only touched on the event-loop thread.
 - A database failure is logged and the charge point still gets a valid reply. For
   StartTransaction that reply is "Invalid" (no session exists, so the CP must not charge).
 
@@ -53,12 +63,31 @@ The row needs all three quantities, so a message lacking one of them only update
 fields it does carry (nothing is filled in or guessed). The session is the charger's active
 session with the message's transactionId, or, when the message has no transactionId, the
 charger's active session. Readings for unknown or finished sessions are dropped.
+
+Accounting (Phase 4, the spec's "Accounting" section): every energy register reading is
+attributed as one interval before it overwrites ``energy_delivered_kwh``:
+``co2_actual_g += delta x CI`` and ``cost_actual_inr += delta x price`` via
+``accounting.apply_interval``, where delta = new reading - energy_delivered_kwh (negative deltas,
+a register reset, are ignored there), CI = ``accounting.actual_carbon_intensity(now, zone)`` -- the
+ACTUAL carbon intensity at receipt time, never a forecast, in the grid zone of the charger's site
+(the zone the orchestrator plans in) -- and price = ``tariff.price_at(now)``.
+StopTransaction attributes the last interval, up to meterStop / 1000, the same way. Both values
+are looked up in the async handler and passed to the database thread. If either cannot be
+obtained, the reading is still stored exactly as before and the unattributed kWh are logged.
+
+Orchestrator hooks (Phase 4): ``app.orchestrator`` is imported lazily inside the functions that
+use it, so importing this module never pulls in the orchestrator (which itself uses the OCPP
+layer) and no import cycle can form. Hooks only schedule work and never await it (DEADLOCK
+RULE): ``request_tick`` is fire-and-forget and ``on_session_started`` runs in a task of its own.
+A hook that fails is logged; the charge point still gets its normal reply and every Phase 2
+effect above still happens.
 """
 import asyncio
 import itertools
 import json
 import logging
 import math
+from collections.abc import Coroutine
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
@@ -69,8 +98,10 @@ from ocpp.v16.datatypes import IdTagInfo
 from ocpp.v16.enums import (
     Action,
     AuthorizationStatus,
+    ChargePointStatus,
     ChargingProfileKindType,
     ChargingProfilePurposeType,
+    ChargingProfileStatus,
     ChargingRateUnitType,
     Measurand,
     RegistrationStatus,
@@ -82,14 +113,25 @@ from sqlalchemy.orm import Session as DbSession
 from app.clock import clock
 from app.config import settings
 from app.db import SessionLocal
-from app.models import Charger, MeterValue, Session
+from app.models import Charger, MeterValue, Session, Site
 from app.ocpp import registry
+from app.providers import tariff
 
 logger = logging.getLogger("greencharge.ocpp.handlers")
 
 # Session.status values (models.Session: active|completed|aborted).
 SESSION_ACTIVE = "active"
 SESSION_COMPLETED = "completed"
+SESSION_ABORTED = "aborted"
+
+# Reasons passed to the orchestrator's request_tick (implementation contract 6b).
+TICK_REASON_SESSION_STOP = "session_stop"
+TICK_REASON_FAULT = "fault"
+TICK_REASON_SESSION_ABORTED = "session_aborted"
+
+# OCPP 1.6 StatusNotification: connectorId 0 reports the charge point's main controller, not a
+# connector, so it never says anything about a transaction.
+MAIN_CONTROLLER_CONNECTOR_ID = 0
 
 # From the spec's SetChargingProfile payload: the chargers have one connector, profiles use
 # stack level 0, and the schedule starts with one period at offset 0.
@@ -102,6 +144,8 @@ PLUG_IN_VENDOR_ID = "GreenCharge"
 PLUG_IN_MESSAGE_ID = "SimPlugIn"
 
 # What the outbound helpers return when the charge point gave no status.
+# OCPP 1.6 uses the same "Accepted" for SetChargingProfile, RemoteStopTransaction and DataTransfer.
+STATUS_ACCEPTED = ChargingProfileStatus.accepted.value
 STATUS_CALL_ERROR = "CallError"  # the charge point answered with a CALLERROR
 STATUS_TIMEOUT = "Timeout"  # no answer within the connection's response timeout
 STATUS_ERROR = "Error"  # the call could not be made (connection closed, invalid payload, ...)
@@ -179,6 +223,149 @@ def parse_meter_values(ocpp_id: str, meter_value: list[dict] | None) -> MeterRea
 
 
 # --------------------------------------------------------------------------------------------
+# Phase 4: orchestrator hooks and per-interval accounting
+# --------------------------------------------------------------------------------------------
+
+# Strong references to the tasks started by ``_run_in_background``: the event loop keeps only
+# weak references to tasks, so an unreferenced task could be garbage-collected mid-run.
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _background_task_done(task: asyncio.Task) -> None:
+    _background_tasks.discard(task)
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.error("Background task %r failed", task.get_name(), exc_info=exc)
+
+
+def _run_in_background(coro: Coroutine[Any, Any, Any], name: str) -> None:
+    """Run ``coro`` as a task of its own; it is never awaited here (DEADLOCK RULE).
+
+    Call it on the event-loop thread. A failure of the task is logged.
+    """
+    try:
+        task = asyncio.create_task(coro, name=name)
+    except BaseException:
+        if asyncio.iscoroutine(coro):
+            coro.close()  # never started: close it so it is not reported as "never awaited"
+        raise
+    _background_tasks.add(task)
+    task.add_done_callback(_background_task_done)
+
+
+def _request_tick(ocpp_id: str, reason: str) -> None:
+    """Ask the orchestrator for a re-plan. ``request_tick`` only schedules the tick
+    (fire-and-forget), so this is safe inside an ``@on`` handler. Never raises."""
+    try:
+        from app.orchestrator import loop as orchestrator_loop
+
+        orchestrator_loop.request_tick(reason)
+    except Exception:
+        logger.exception("%s: could not request an orchestrator tick (%s)", ocpp_id, reason)
+
+
+@dataclass(frozen=True)
+class IntervalRates:
+    """What one kWh of a meter interval is charged with at receipt time: the ACTUAL carbon
+    intensity (gCO2eq/kWh) and the tariff energy charge (INR/kWh)."""
+
+    carbon_intensity: float
+    price_inr_per_kwh: float
+
+
+# ocpp_id -> the grid zone of that charge point's site. A site does not move between zones, so
+# the lookup is done once per charge point (a demo reset keeps the sites and chargers).
+_charger_zones: dict[str, str] = {}
+
+
+def _db_charger_zone(ocpp_id: str) -> str | None:
+    """The grid zone of the charger's site, or None when there is no such charger."""
+    with SessionLocal() as db:
+        return db.scalar(
+            select(Site.grid_zone)
+            .join(Charger, Charger.site_id == Site.id)
+            .where(Charger.ocpp_id == ocpp_id)
+        )
+
+
+async def _zone_for(ocpp_id: str) -> str:
+    """The grid zone this charge point draws from: its site's ``grid_zone``, the same zone the
+    orchestrator prices its plans in. Cached; falls back to ``settings.electricity_maps_zone``
+    (the provider's default zone) when the charger cannot be read. Never raises."""
+    zone = _charger_zones.get(ocpp_id)
+    if zone is not None:
+        return zone
+    try:
+        zone = await asyncio.to_thread(_db_charger_zone, ocpp_id)
+    except Exception:
+        logger.exception("%s: could not read the site's grid zone", ocpp_id)
+        zone = None
+    if not zone:
+        return settings.electricity_maps_zone
+    _charger_zones[ocpp_id] = zone
+    return zone
+
+
+async def _interval_rates(ocpp_id: str, now: datetime) -> IntervalRates | None:
+    """The actual carbon intensity and the tariff price at ``now``, or None (logged) when either
+    cannot be obtained. Never raises."""
+    try:
+        from app.orchestrator import accounting
+
+        carbon_intensity = float(
+            await accounting.actual_carbon_intensity(now, await _zone_for(ocpp_id))
+        )
+        price = float(tariff.price_at(now))
+    except Exception:
+        logger.exception(
+            "%s: no actual carbon intensity or tariff price for %s", ocpp_id, now.isoformat()
+        )
+        return None
+    if not (math.isfinite(carbon_intensity) and math.isfinite(price)):
+        # A NaN would poison the session's running totals for good.
+        logger.error(
+            "%s: non-finite carbon intensity %r or tariff price %r for %s",
+            ocpp_id, carbon_intensity, price, now.isoformat(),
+        )
+        return None
+    return IntervalRates(carbon_intensity=carbon_intensity, price_inr_per_kwh=price)
+
+
+def _attribute_energy(
+    ocpp_id: str, session: Session, new_energy_kwh: float, rates: IntervalRates | None
+) -> None:
+    """Attribute the energy since the session's last reading (``new_energy_kwh`` minus
+    ``energy_delivered_kwh``) to its actual CO2 and cost with ``accounting.apply_interval``.
+
+    Call it inside the database transaction, BEFORE ``energy_delivered_kwh`` is overwritten.
+    Never raises, so the reading itself is always stored.
+    """
+    delta_kwh = new_energy_kwh - session.energy_delivered_kwh
+    if rates is None:
+        if delta_kwh > 0:
+            logger.warning(
+                "%s: %.4f kWh of session %d not attributed to CO2 and cost (no carbon "
+                "intensity or tariff price)", ocpp_id, delta_kwh, session.id,
+            )
+        return
+    before = (session.co2_actual_g, session.cost_actual_inr)
+    try:
+        from app.orchestrator import accounting
+
+        accounting.apply_interval(
+            session, delta_kwh, rates.carbon_intensity, rates.price_inr_per_kwh
+        )
+    except Exception:
+        session.co2_actual_g, session.cost_actual_inr = before  # never keep half an interval
+        logger.exception(
+            "%s: could not attribute %.4f kWh of session %d to CO2 and cost",
+            ocpp_id, delta_kwh, session.id,
+        )
+
+
+# --------------------------------------------------------------------------------------------
 # Database work (sync; run in a worker thread, one short transaction each)
 # --------------------------------------------------------------------------------------------
 
@@ -235,10 +422,15 @@ def _find_session(
 
 
 def _db_record_meter_values(
-    ocpp_id: str, transaction_id: int | None, reading: MeterReading, now: datetime
+    ocpp_id: str,
+    transaction_id: int | None,
+    reading: MeterReading,
+    now: datetime,
+    rates: IntervalRates | None,
 ) -> None:
     """Store one MeterValues message: the session fields it carries and, when it carries power,
-    energy and SoC, one MeterValue row stamped ``now``."""
+    energy and SoC, one MeterValue row stamped ``now``. An energy reading is first attributed to
+    the session's actual CO2 and cost with ``rates`` (the values at ``now``)."""
     with SessionLocal() as db:
         session = _find_session(db, ocpp_id, transaction_id, active_only=True)
         if session is None:
@@ -252,6 +444,7 @@ def _db_record_meter_values(
                              "dropped", ocpp_id)
             return
         if reading.energy_kwh is not None:
+            _attribute_energy(ocpp_id, session, reading.energy_kwh, rates)  # before overwriting
             session.energy_delivered_kwh = reading.energy_kwh
         if reading.soc is not None:
             session.soc_current = reading.soc
@@ -273,17 +466,22 @@ def _db_record_meter_values(
         db.commit()
 
 
-def _db_stop_session(ocpp_id: str, transaction_id: int, meter_stop_wh: int) -> int | None:
+def _db_stop_session(
+    ocpp_id: str, transaction_id: int, meter_stop_wh: int, rates: IntervalRates | None
+) -> int | None:
     """Complete the session of a StopTransaction; return its id, or None if there is none.
 
     energy_delivered_kwh = meterStop / 1000 (the simulated meter restarts at 0 for every
-    transaction). Only an active session becomes "completed"; another status is kept.
+    transaction), after the last interval up to it is attributed to the session's actual CO2
+    and cost with ``rates``. Only an active session becomes "completed"; another status is kept.
     """
     with SessionLocal() as db:
         session = _find_session(db, ocpp_id, transaction_id, active_only=False)
         if session is None:
             return None
-        session.energy_delivered_kwh = meter_stop_wh / WH_PER_KWH
+        energy_kwh = meter_stop_wh / WH_PER_KWH
+        _attribute_energy(ocpp_id, session, energy_kwh, rates)  # before overwriting
+        session.energy_delivered_kwh = energy_kwh
         if session.status == SESSION_ACTIVE:
             session.status = SESSION_COMPLETED
         else:
@@ -293,6 +491,28 @@ def _db_stop_session(ocpp_id: str, transaction_id: int, meter_stop_wh: int) -> i
             )
         db.commit()
         return session.id
+
+
+def _db_abort_active_sessions(ocpp_id: str) -> list[int]:
+    """Mark the charger's active sessions "aborted"; return their ids (normally none or one).
+
+    For a connector that reports Available while a session is still active: the charge point
+    has lost that transaction (for example the simulator restarted), so no StopTransaction will
+    ever complete it.
+    """
+    with SessionLocal() as db:
+        sessions = db.scalars(
+            select(Session)
+            .join(Session.charger)
+            .where(Charger.ocpp_id == ocpp_id, Session.status == SESSION_ACTIVE)
+            .order_by(Session.id)
+        ).all()
+        aborted = [session.id for session in sessions]
+        for session in sessions:
+            session.status = SESSION_ABORTED
+        if aborted:
+            db.commit()
+    return aborted
 
 
 def _start_rejected() -> call_result.StartTransaction:
@@ -349,6 +569,14 @@ class CentralSystemChargePoint(ChargePoint):
             self.id, connector_id, status, error_code, kwargs.get("timestamp"),
         )
         await self._update_charger(status=status)
+        # Phase 4 hooks; they run after the status is stored, so a re-plan sees it.
+        if status == ChargePointStatus.faulted:
+            _request_tick(self.id, TICK_REASON_FAULT)
+        elif (
+            status == ChargePointStatus.available
+            and connector_id != MAIN_CONTROLLER_CONNECTOR_ID
+        ):
+            await self._abort_lost_sessions()
         return call_result.StatusNotification()
 
     @on(Action.start_transaction)
@@ -383,7 +611,9 @@ class CentralSystemChargePoint(ChargePoint):
 
     @after(Action.start_transaction)
     def after_start_transaction(self, **kwargs: Any) -> None:
-        """Runs once the StartTransaction reply has been sent: resolve the plug-in waiter."""
+        """Runs once the StartTransaction reply has been sent: resolve the plug-in waiter, then
+        start the orchestrator's ``on_session_started`` (baseline, then a re-plan) in a task of
+        its own -- never awaited here (DEADLOCK RULE)."""
         session_id, self._started_session_id = self._started_session_id, None
         if session_id is None:
             return
@@ -394,6 +624,17 @@ class CentralSystemChargePoint(ChargePoint):
                 waiter.set_result(session_id)
         except Exception:
             logger.exception("%s: could not resolve the plug-in waiter", self.id)
+        try:
+            from app.orchestrator import loop as orchestrator_loop
+
+            _run_in_background(
+                orchestrator_loop.on_session_started(session_id),
+                f"session {session_id} started",
+            )
+        except Exception:
+            logger.exception(
+                "%s: could not start the orchestrator for new session %d", self.id, session_id
+            )
 
     @on(Action.meter_values)
     async def on_meter_values(
@@ -405,8 +646,12 @@ class CentralSystemChargePoint(ChargePoint):
     ) -> call_result.MeterValues:
         now = clock.now()
         reading = parse_meter_values(self.id, meter_value)
+        # Only an energy reading is attributed; the rates are the ones at receipt time.
+        rates = None if reading.energy_kwh is None else await _interval_rates(self.id, now)
         try:
-            await asyncio.to_thread(_db_record_meter_values, self.id, transaction_id, reading, now)
+            await asyncio.to_thread(
+                _db_record_meter_values, self.id, transaction_id, reading, now, rates
+            )
         except Exception:
             logger.exception("%s: could not store MeterValues", self.id)
         return call_result.MeterValues()
@@ -415,9 +660,10 @@ class CentralSystemChargePoint(ChargePoint):
     async def on_stop_transaction(
         self, meter_stop: int, timestamp: str, transaction_id: int, **kwargs: Any
     ) -> call_result.StopTransaction:
+        rates = await _interval_rates(self.id, clock.now())
         try:
             session_id = await asyncio.to_thread(
-                _db_stop_session, self.id, transaction_id, meter_stop
+                _db_stop_session, self.id, transaction_id, meter_stop, rates
             )
         except Exception:
             logger.exception("%s: could not complete transaction %s", self.id, transaction_id)
@@ -433,6 +679,7 @@ class CentralSystemChargePoint(ChargePoint):
                 "%s) -> session %d completed",
                 self.id, transaction_id, kwargs.get("reason"), meter_stop, timestamp, session_id,
             )
+        _request_tick(self.id, TICK_REASON_SESSION_STOP)
         return call_result.StopTransaction()
 
     async def _update_charger(self, **values: Any) -> None:
@@ -443,6 +690,25 @@ class CentralSystemChargePoint(ChargePoint):
             return
         if not found:
             logger.warning("%s: no charger row with this ocpp_id", self.id)
+
+    async def _abort_lost_sessions(self) -> None:
+        """The connector reported Available: a session still active on this charger was lost by
+        the charge point. Mark it "aborted", drop its manual limit and request a re-plan."""
+        try:
+            aborted = await asyncio.to_thread(_db_abort_active_sessions, self.id)
+        except Exception:
+            logger.exception("%s: could not check for sessions lost by the charge point", self.id)
+            return
+        if not aborted:
+            return
+        for session_id in aborted:
+            registry.manual_limits_w.pop(session_id, None)
+        logger.warning(
+            "%s: reported Available with session(s) %s still active; the charge point lost the "
+            "transaction, session(s) marked %s",
+            self.id, ", ".join(map(str, aborted)), SESSION_ABORTED,
+        )
+        _request_tick(self.id, TICK_REASON_SESSION_ABORTED)
 
     # ---- outbound: CSMS -> CP (never await these inside an @on handler) --------------------
 
@@ -473,7 +739,10 @@ class CentralSystemChargePoint(ChargePoint):
         except Exception:
             logger.exception("%s: could not build %s", self.id, what)
             return STATUS_ERROR
-        return await self._call_for_status(payload, what)
+        # One INFO line per profile would bury the orchestrator's tick line: the tick sends one
+        # per active session, every tick. An accepted profile is logged at DEBUG (the frame is
+        # still in GET /api/ocpp/log); anything else stays at INFO.
+        return await self._call_for_status(payload, what, accepted_level=logging.DEBUG)
 
     async def remote_stop(self, transaction_id: int) -> str:
         """Ask the charge point to stop the transaction (operator override)."""
@@ -501,8 +770,13 @@ class CentralSystemChargePoint(ChargePoint):
             return STATUS_ERROR
         return await self._call_for_status(payload, what)
 
-    async def _call_for_status(self, payload: Any, what: str) -> str:
-        """Send one call and return the charge point's status string; never raises."""
+    async def _call_for_status(
+        self, payload: Any, what: str, accepted_level: int = logging.INFO
+    ) -> str:
+        """Send one call and return the charge point's status string; never raises.
+
+        An "Accepted" answer is logged at ``accepted_level``; every other status is logged at
+        INFO, so a rejection is never hidden."""
         try:
             result = await self.call(payload)
         except asyncio.TimeoutError:
@@ -515,5 +789,8 @@ class CentralSystemChargePoint(ChargePoint):
             logger.warning("%s: %s was answered with a CALLERROR", self.id, what)
             return STATUS_CALL_ERROR
         status = str(result.status)
-        logger.info("%s: %s -> %s", self.id, what, status)
+        logger.log(
+            accepted_level if status == STATUS_ACCEPTED else logging.INFO,
+            "%s: %s -> %s", self.id, what, status,
+        )
         return status

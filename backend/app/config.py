@@ -37,5 +37,9 @@ class Settings(BaseSettings):
     time_scale: float = 60.0          # TIME_SCALE env var
     heartbeat_interval_s: int = 30    # spec: BootNotification interval=30
 
+    # Phase 4: the orchestration loop (app/orchestrator/loop.py) and on-time accounting.
+    tick_minutes: int = 5            # spec: "The tick — runs every 5 minutes" (SIMULATED minutes)
+    soc_tolerance: float = 1e-4      # SoC travels as a 3-decimal percent string; completed-on-time check tolerance
+
 
 settings = Settings()
