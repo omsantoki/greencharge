@@ -27,5 +27,11 @@ class Settings(BaseSettings):
     site_lat: float = 23.1866
     site_lon: float = 72.6291
 
+    # Phase 1: site-local time zone, slot grid and seed-data directory.
+    site_timezone: str = "Asia/Kolkata"
+    slot_minutes: int = 15
+    horizon_slots: int = 96
+    data_dir: Path = Path(__file__).resolve().parent / "data"
+
 
 settings = Settings()

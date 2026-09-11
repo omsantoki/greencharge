@@ -1,18 +1,40 @@
 """GreenCharge FastAPI application.
 
-Phase 0 scaffold: only the /health endpoint. No tables, no routers yet.
+/health (liveness plus DB/Redis reachability), and the Phase 1 data-layer routers: grid carbon
+intensity and tariff (`app.routers.grid`) and sites with nested chargers (`app.routers.sites`).
+Tables are created idempotently at startup.
 """
 import logging
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 
 import redis
 from fastapi import FastAPI
 
 from app.config import settings
-from app.db import db_ok
+from app.db import Base, db_ok, engine
+from app.routers import grid, sites
 
 logger = logging.getLogger("greencharge.main")
 
-app = FastAPI(title="GreenCharge")
+
+@asynccontextmanager
+async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+    # Importing the models registers every table on Base.metadata before create_all.
+    from app import models  # noqa: F401
+
+    # create_all is idempotent. A failure (e.g. Postgres down) is logged, not raised, so the app
+    # still starts and /health can report db=false.
+    try:
+        Base.metadata.create_all(engine)
+    except Exception as exc:
+        logger.warning("Could not create database tables at startup: %s", exc)
+    yield
+
+
+app = FastAPI(title="GreenCharge", lifespan=lifespan)
+app.include_router(grid.router)
+app.include_router(sites.router)
 
 
 def redis_ok() -> bool:
