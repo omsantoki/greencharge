@@ -33,5 +33,9 @@ class Settings(BaseSettings):
     horizon_slots: int = 96
     data_dir: Path = Path(__file__).resolve().parent / "data"
 
+    # Phase 2: simulated-time compression (see app/clock.py) and the OCPP heartbeat interval.
+    time_scale: float = 60.0          # TIME_SCALE env var
+    heartbeat_interval_s: int = 30    # spec: BootNotification interval=30
+
 
 settings = Settings()

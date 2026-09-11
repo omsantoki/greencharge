@@ -6,12 +6,19 @@
    ``max_power_kw`` = 40.0. The 40 kW limit is a user-approved deviation from the spec's
    150 kW: the vehicles' AC limits (7.0-11 kW) cap six cars at about 47 kW, so a 150 kW limit
    would never bind (recorded in README).
-3. Upserts chargers CP001..CP006, matched by ``ocpp_id``: 22.0 kW each, status "Available",
-   all attached to that site.
+3. Upserts chargers CP001..CP006, matched by ``ocpp_id``: 22.0 kW each, all attached to that
+   site. A new charger row starts with status "Available". An existing charger keeps its live
+   OCPP state (``status`` and ``last_heartbeat``, written by the CSMS), so re-running the seed
+   while chargers are connected does not clobber it.
 
 Existing rows are updated in place, so running it again still leaves 1 site and 6 chargers.
 Prints a summary of what is in the database afterwards.
+
+Also home of the vehicle catalogue helpers ``load_vehicles()`` and ``get_vehicle()``, which
+read data/vehicles.json.
 """
+import json
+
 from sqlalchemy import func, select
 
 from app.config import settings
@@ -23,7 +30,36 @@ SITE_NAME = "DAU Campus Charging Hub"
 SITE_MAX_POWER_KW = 40.0  # user-approved deviation from the spec's 150 kW (see docstring)
 CHARGER_OCPP_IDS = ("CP001", "CP002", "CP003", "CP004", "CP005", "CP006")
 CHARGER_MAX_POWER_KW = 22.0
-CHARGER_STATUS = "Available"
+CHARGER_STATUS = "Available"  # set only when a charger row is first inserted
+
+VEHICLES_FILE = settings.data_dir / "vehicles.json"
+
+
+def load_vehicles() -> list[dict]:
+    """The vehicle catalogue: the ``"vehicles"`` list of data/vehicles.json.
+
+    Each entry has ``model``, ``battery_kwh``, ``max_ac_kw`` and ``max_dc_kw``. The file is read
+    on every call (it is tiny), so each caller gets its own copy.
+    """
+    with VEHICLES_FILE.open(encoding="utf-8") as f:
+        return json.load(f)["vehicles"]
+
+
+def _normalise_model(name: str) -> str:
+    return " ".join(name.split()).casefold()
+
+
+def get_vehicle(model: str) -> dict | None:
+    """The catalogue entry whose ``model`` matches, or None.
+
+    Matching ignores case and extra whitespace ("tata  nexon ev" finds "Tata Nexon EV"); the
+    returned entry carries the canonical model name.
+    """
+    wanted = _normalise_model(model)
+    for vehicle in load_vehicles():
+        if _normalise_model(vehicle["model"]) == wanted:
+            return vehicle
+    return None
 
 
 def seed() -> None:
@@ -35,7 +71,6 @@ def seed() -> None:
         "max_power_kw": SITE_MAX_POWER_KW,
         "demand_charge_inr_per_kva": demand_charge_inr_per_kva_month(),
     }
-    charger_values = {"max_power_kw": CHARGER_MAX_POWER_KW, "status": CHARGER_STATUS}
 
     Base.metadata.create_all(engine)
 
@@ -56,12 +91,20 @@ def seed() -> None:
                 select(Charger).where(Charger.ocpp_id == ocpp_id)
             ).one_or_none()
             if charger is None:
-                db.add(Charger(ocpp_id=ocpp_id, site_id=site.id, **charger_values))
+                db.add(
+                    Charger(
+                        ocpp_id=ocpp_id,
+                        site_id=site.id,
+                        max_power_kw=CHARGER_MAX_POWER_KW,
+                        status=CHARGER_STATUS,
+                    )
+                )
                 chargers_created += 1
             else:
+                # Configuration only: status and last_heartbeat are live OCPP state owned by
+                # the CSMS and are left as they are.
                 charger.site_id = site.id
-                for field, value in charger_values.items():
-                    setattr(charger, field, value)
+                charger.max_power_kw = CHARGER_MAX_POWER_KW
                 chargers_updated += 1
 
         db.commit()

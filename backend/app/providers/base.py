@@ -21,6 +21,7 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
+from app.clock import clock
 from app.config import settings
 from app.db import engine
 from app.models import GridData
@@ -58,12 +59,13 @@ class ProviderError(RuntimeError):
 
 
 def current_time() -> datetime:
-    """Return "now" as a timezone-aware UTC datetime.
+    """Return "now" as a timezone-aware UTC datetime: the simulation clock's time.
 
-    Every Phase 1 read of the current time goes through here. Phase 2 changes this body to
-    return the simulation clock.
+    Every Phase 1 read of the current time goes through here. Since Phase 2 it returns
+    ``app.clock.clock.now()``, which runs ``TIME_SCALE`` times faster than real time and can be
+    moved with ``clock.set_now()``.
     """
-    return datetime.now(timezone.utc)
+    return clock.now()
 
 
 def _require_aware(dt: datetime, name: str) -> None:

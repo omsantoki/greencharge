@@ -4,6 +4,7 @@ The acceptance tests post JSON with `curl -X POST ... -d '{json}'` and no Conten
 curl sends `application/x-www-form-urlencoded`, which FastAPI's normal body parsing rejects with 422.
 Every POST endpoint therefore reads the raw body and validates it with `parse_json_body`.
 """
+import math
 from typing import TypeVar
 
 from fastapi import HTTPException, Request
@@ -25,8 +26,13 @@ async def parse_json_body(request: Request, model: type[T]) -> T:
     except ValidationError as exc:
         # A body that is not valid UTF-8 comes back as raw bytes in "input"; decode it leniently
         # so encoding the error cannot fail (otherwise the client would get a 500, not a 422).
+        # Likewise a non-finite number (NaN, Infinity, or an overflowing literal such as 1e400)
+        # comes back as a float that JSON cannot carry, so it is echoed as a string ("inf", "nan").
         detail = jsonable_encoder(
             exc.errors(include_url=False),
-            custom_encoder={bytes: lambda b: b.decode("utf-8", errors="replace")},
+            custom_encoder={
+                bytes: lambda b: b.decode("utf-8", errors="replace"),
+                float: lambda f: f if math.isfinite(f) else str(f),
+            },
         )
         raise HTTPException(status_code=422, detail=detail) from exc
