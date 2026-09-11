@@ -5,8 +5,10 @@ Dhirubhai Ambani University. It is built one phase at a time against the project
 specification (`BUILD_SPEC.md`, the single source of truth, kept outside this directory); a phase
 starts only after the previous phase's acceptance test passes. So far it has Phase 0 (a running
 skeleton), Phase 1 (the data layer: database schema, seed data, and grid carbon-intensity, tariff
-and site data over HTTP) and Phase 2 (the OCPP layer: an OCPP 1.6J server inside the API process and
-six simulated chargers that obey remote power limits). There is no optimizer or dashboard yet.
+and site data over HTTP), Phase 2 (the OCPP layer: an OCPP 1.6J server inside the API process and
+six simulated chargers that obey remote power limits) and Phase 3 (the optimizer: a linear program
+that plans each car's charging power for the next 24 hours). The optimizer is not yet run on live
+sessions, and there is no dashboard yet.
 
 ## Prerequisites
 
@@ -203,6 +205,46 @@ curl -s localhost:8000/api/sessions/1/meter-values | tail -1   # power_kw 5.0 in
 Session ids come from a database sequence, so that plug-in is session 1 only on a database with no
 sessions yet (see the reset under "Decisions & deviations").
 
+## Optimizer (Phase 3)
+
+`optimize(OptimizerInput) -> OptimizerResult` in `backend/app/optimizer/engine.py` plans each car's
+charging power (kW) for 96 slots of 15 minutes. It is a pure function (no database, network, clock
+or file access of its own) that builds a linear program with PuLP and solves it with the CBC solver
+bundled with PuLP. Every variable is continuous; there are no integer or binary variables.
+
+- **Objective:** minimise `Σ_cars Σ_slots p · Δt · (α · carbon / 1000 + β · price)`, i.e. kg of CO₂
+  plus a small weight on cost in INR (defaults α = 1.0, β = 0.001, Δt = 0.25 h).
+- **Constraints:** (C1) each car gets its energy, `Σ p · Δt · η ≥ energy needed` with η = 0.92;
+  (C2) `0 ≤ p ≤ max kW`, and 0 in slots where the car is not available; (C3) the cars' total stays
+  within the site limit in every slot; (C4) a car's optional safety energy arrives in slots 0–3.
+- **Relaxed path:** if CBC reports anything other than Optimal, the model is solved again with (C1)
+  made soft: a car may fall short by `unmet` kWh, and each unmet kWh costs M = 10⁶ in the objective.
+  The result has `status="relaxed"`, the best schedule possible and `unmet_energy_kwh` per car, which
+  is what lets the UI say "I can only get you to X% by that time" instead of showing an error. If
+  even that model has no solution (for example safety energy that cannot arrive in slots 0–3), the
+  status is `"infeasible"`: every schedule is all zeros and each car's unmet energy is its whole
+  energy need.
+- Malformed input raises `ValueError`: a carbon, price or availability list that is not 96 long, a
+  NaN or infinite number, a repeated session id, or a negative max kW.
+
+The spec's three fixtures are the acceptance test. Run them from `backend/` with the venv. No Docker
+service or server is needed, because the fixtures read only the JSON files in `backend/app/data/`:
+
+```bash
+cd backend
+source ../.venv/bin/activate
+python -m app.optimizer.fixtures --run-all
+```
+
+For each fixture it prints the solve status, PASS or FAIL with the measured values, and the solve
+time. It exits 1 if any fixture fails, including when `fixture_site_constrained` takes 2 s or longer.
+
+**Apple Silicon:** PuLP's bundled CBC binary for macOS is x86_64 only, so on Apple Silicon it runs
+under Rosetta 2 (`softwareupdate --install-rosetta` if it is not installed). Without Rosetta, CBC
+cannot start and `optimize` fails with an `OSError`. The first CBC run after installing the venv
+takes about a second longer while macOS checks and translates the binary; later solves take tens
+of milliseconds.
+
 ## Decisions & deviations
 
 Decisions (2026-09-11) that refine or deviate from the spec, and known limitations:
@@ -281,3 +323,4 @@ Phase 2 (OCPP layer):
 - Phase 0 — Scaffold: acceptance passed (`/health` reports db and redis true; page reads "GreenCharge")
 - Phase 1 — Data layer: acceptance passed (forecast has 96 slots with a 291 g/kWh spread; 6 chargers)
 - Phase 2 — OCPP layer: acceptance passed (6 chargers connected; a remote 5000 W SetChargingProfile throttles the car from 7.2 kW to 5.0 kW)
+- Phase 3 — Optimizer: acceptance passed (3/3 fixtures; site-constrained solve ≈ 25 ms against the 2 s limit)
