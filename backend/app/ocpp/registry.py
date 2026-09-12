@@ -19,7 +19,8 @@ they reconnect.
   their transactions (OCPP has no call that makes one forget), and the demo reset needs a
   transaction id to stop them with. Kept across a reconnect, because the transaction is.
 - ``ocpp_log``: the most recent raw OCPP-J frames in both directions, stamped with the simulation
-  clock, for the operator dashboard.
+  clock, for the operator dashboard. Cleared by the demo reset (``clear_log()``), which moves that
+  clock backwards.
 """
 import asyncio
 from collections import deque
@@ -102,6 +103,26 @@ def log_frame(direction: str, ocpp_id: str, frame: str) -> None:
             "frame": frame,
         }
     )
+
+
+def clear_log() -> None:
+    """Drop every frame in ``ocpp_log``. Called by the demo reset, which moves the simulation
+    clock BACKWARDS.
+
+    Every frame is stamped with ``clock.now()``, and the reset puts the clock back to 18:30 site
+    time (``scenarios.reset_start()``), which is EARLIER than the frames already logged. The
+    dashboard panel orders what it is given newest-first by that stamp, so without this the
+    frames from before the reset outrank everything logged after it and stay pinned to the top
+    of the panel -- the log looks frozen in the future while the header clock reads 18:30, and
+    it only comes right once ~50 new frames have aged the old ones out of the ring buffer (tens
+    of seconds; longer still with no scenario running). Do not remove this call: as long as the
+    reset moves the clock backwards, the frames from before it can only misorder the ones after.
+
+    The log is demo state like the rest of what the reset clears, and the charge points refill it
+    within a second (Heartbeats, StatusNotifications), so a panel emptied here is never empty for
+    long.
+    """
+    ocpp_log.clear()
 
 
 def recent_frames(limit: int = 50) -> list[dict]:

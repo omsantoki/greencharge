@@ -51,7 +51,10 @@ Demo reset (POST /api/demo/reset, and step 1 of every scenario), ``perform_reset
    milliseconds is what wedged the demo;
 4. ``TRUNCATE meter_values, schedules, sessions RESTART IDENTITY CASCADE`` -- sites, chargers and
    grid_data (the seed data and the carbon cache) survive;
-5. clears ``registry.manual_limits_w``, ``pending_plugins`` and ``session_waiters``, and keeps in
+5. clears ``registry.manual_limits_w``, ``pending_plugins``, ``session_waiters`` and the OCPP
+   frame log ``registry.ocpp_log`` (the log is stamped with the simulation clock the next step
+   moves BACKWARDS, so frames from before a reset would outrank every later one in the dashboard
+   panel -- see ``registry.clear_log()``), and keeps in
    ``live_transactions`` the transaction id of every charge point that did NOT come back: with
    the tables gone that id is the only thing a later reset could stop it with;
 6. puts the simulation clock back to ``reset_start()`` -- 18:30 site time on today's real date,
@@ -550,7 +553,8 @@ def _target_stopped(
 
 async def perform_reset() -> dict[str, Any]:
     """Reset all demo state (see the module docstring). Seed data and grid_data survive, and the
-    simulation clock goes back to ``reset_start()`` (18:30 site time on today's real date).
+    simulation clock goes back to ``reset_start()`` (18:30 site time on today's real date), which
+    is also why the OCPP frame log is cleared: its stamps come from that clock.
 
     Returns ``{"reset", "sessions": [{"session_id", "ocpp_id", "remote_stop", "stopped"}],
     "waited_s", "truncated"}``: one entry per charge point that had to be brought back to
@@ -598,6 +602,16 @@ async def perform_reset() -> dict[str, Any]:
         # interval is REAL seconds, so it keeps ticking across the jump. The charge points run
         # clocks of their own and re-anchor to ours on their next Heartbeat.
         clock.set_now(reset_start())
+        # The frame log goes with the clock. Its entries are stamped with the simulation clock and
+        # the dashboard panel orders them newest-first by that stamp, so frames logged before the
+        # jump (up to 22:xx site time after a run) would outrank every frame logged after it and
+        # sit frozen at the top of the panel while the header clock reads 18:30 -- for as long as
+        # it takes ~200 new frames to age them out of the ring buffer, which with nothing plugged
+        # in is a minute of a demo looking hung. Clearing here, AFTER the jump, is what keeps the
+        # panel monotonic; the charge points refill it within a second (Heartbeats,
+        # StatusNotifications), and the scenario that follows a reset writes its own frames into
+        # an empty panel rather than underneath stale ones.
+        registry.clear_log()
         # A tick that read the old sessions may still be running; tick() holds the orchestrator's
         # lock, so this one runs only after it and sees the empty tables. Then forget its state.
         # The wait is bounded: a charge point that stops answering can hold the tick lock for the
