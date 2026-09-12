@@ -24,9 +24,10 @@ Energies are grid-side (what the charger draws, i.e. the Energy.Active.Import.Re
   in ``grid_data``, resampled onto the slots with ``resample_to_slots``. On time when the last tick
   left the session no unmet energy.
 
-Two rules keep that figure honest, and steady between polls. BOTH matter: without them a session
-the optimizer cannot fill by its deadline swings between "saved" and "cost more" every few
-seconds, because the measured side and the planned side move on different clocks.
+Two rules keep that figure honest, and steady between polls. BOTH matter: without them the figure
+swings by the energy of a whole reading period or a whole slot every few seconds, because the
+measured side and the planned side move on different clocks -- the meter every reading period, the
+plan every tick and every slot boundary.
 
 1. Like for like (``baseline.baseline_tail``). The baseline is the naive charge cut down to the
    grid energy the session actually takes -- what the meter has reported plus what is still
@@ -34,9 +35,12 @@ seconds, because the measured side and the planned side move on different clocks
    so its stored baseline is used unchanged; one that takes less (its plan cannot reach the target
    by the deadline, or it was unplugged early) is compared with a naive charge of the same size
    instead of being credited for energy no car ever accepted.
-2. Measured and planned must tile the session once (``_remaining_charging``): no gap, no overlap.
-   Measurement stops at the last meter reading, which is also where ``soc_current`` was last
-   written, so the two sides meet there.
+2. Measured and planned must tile the session exactly once (``_remaining_charging``), at every
+   instant and not only at a tick: no gap, no overlap. Measurement stops at the last meter
+   reading, which is also where ``soc_current`` and ``energy_delivered_kwh`` were last written, so
+   the charging still ahead is what that same reading says the car can still take. A plan is sized
+   from the reading the TICK saw, so between ticks its opening slots are charging the measured
+   side already holds, and they come off the front.
 
 Savings of an active session are therefore a projection: the actual part is measured, the plan
 part is forecast. Only energy that is planned is counted, so an active session whose plan leaves
@@ -210,40 +214,56 @@ def _remaining_charging(
 
     ``slots`` is the session's latest plan as ``(slot_start, kW)`` pairs, earliest first, and
     ``measured_to`` the last meter reading the session row reflects (``_last_meter_ts_cte`` for the
-    summary, ``_delivered_by_slot`` for one session) -- where measurement stops and the
-    projection has to take over, with no gap and no overlap, or the savings figure jumps every
-    time one of the two moves.
+    summary, ``_delivered_by_slot`` for one session). Measured and projected charging must tile the
+    session exactly once at EVERY instant, not only at a tick, or the figure jumps by whatever they
+    disagree about every time either side moves.
 
-    How much energy the plan still holds depends on what kind of plan it is:
+    ``energy_needed_kwh / efficiency`` is the grid energy the car can still take, as of that same
+    reading. Which half of the plan that pins down depends on whether the plan can deliver it:
 
-    - While it still covers everything the car needs, it is priced whole, wherever in the horizon
-      the optimizer put it. The tick built it from ``energy_needed`` as of ``soc_current``, which
-      was written by that same last meter reading, so the plan IS "everything after
-      ``measured_to``"; its slot boundaries say when that energy flows, not how much of it is left.
-    - Once it cannot cover it (the optimizer had to leave energy unmet) the plan stops being a
-      promise about energy and is only a description of power over time -- it charges as hard as
-      it can for as long as it can -- so it has to be read from ``measured_to``: the part of a slot
-      the meter has already covered comes off, and charging that has happened since the last
-      reading but which the plan has already moved past (it starts at the slot the last tick ran
-      in) goes back on at the plan's first-slot power, the limit the charge point is following
-      right now. Never more of that than the plan leaves the car still needing, so nothing is
-      counted twice at the moment a plan stops covering the target.
-
-      Without this a short plan loses a whole 15-minute slot the instant ``now`` crosses a slot
-      boundary while the meter catches up only once a reading period, and the two staircases beat
-      against each other: the projection swings by a slot of energy every few seconds.
+    - A plan that still covers it (the normal case, and the one the demo spends its time in) holds
+      exactly that much of the session's future, wherever in the horizon the optimizer put it: its
+      slots say WHEN the energy flows, not how much is left. So it is priced at that energy, with
+      the front dropped -- the plan is executed earliest slot first, and a plan is sized from the
+      reading THE TICK saw, so between ticks its opening slots are charging the meter has since
+      reported. Pricing it whole counts those twice, up to a whole tick of charging, and the
+      scorecard sinks at every reading and springs back at the next tick. Nothing is dropped when
+      the tick has just run, or when the plan defers charging (its opening slots are 0 kW), so this
+      leaves an idle or freshly planned session exactly as it was.
+      Note that the front cannot be cut by TIME instead: slot 0 of a plan starts at the slot the
+      tick ran in, so it deliberately spans minutes that have already passed, and pro-rating it
+      away would throw out energy the car has yet to draw.
+    - A plan that cannot cover it (the optimizer had to leave energy unmet) is not a promise about
+      energy at all -- it charges as hard as it can for as long as it can -- so its energy shrinks
+      by a whole 15-minute slot the instant ``now`` crosses a slot boundary, while the meter
+      catches up only once a reading period, and the two staircases beat against each other. That
+      one has to be read as a power curve from ``measured_to``: the part of a slot the meter has
+      already covered comes off, and charging that has happened since the last reading but which
+      the plan has already moved past goes back on at the plan's first-slot power, the limit the
+      charge point is following right now -- never more of it than the car still needs.
 
     Slots of 0 kW are dropped; they add nothing to any of the sums. Pure computation.
     """
     slot = _slot()
     slot_hours = slot / _HOUR
-    planned = [(slot_start, kw * slot_hours) for slot_start, kw in slots if kw > 0]
-    if not planned:
+    if not any(kw > 0 for _, kw in slots):
         return []
-    if sum(energy for _, energy in planned) * efficiency >= energy_needed_kwh - tolerance:
-        return planned
 
-    # A plan that is short, read as a power curve from the last meter reading.
+    can_take_kwh = energy_needed_kwh / efficiency
+    planned = [(slot_start, kw * slot_hours) for slot_start, kw in slots if kw > 0]
+    delivered_since_planned = sum(energy for _, energy in planned) - can_take_kwh
+    if delivered_since_planned > -tolerance:  # the plan still covers what the car needs
+        remaining: list[tuple[datetime, float]] = []
+        for slot_start, energy_kwh in planned:
+            if delivered_since_planned >= energy_kwh:  # wholly drawn already
+                delivered_since_planned -= energy_kwh
+                continue
+            if delivered_since_planned > 0:
+                energy_kwh -= delivered_since_planned
+                delivered_since_planned = 0.0
+            remaining.append((slot_start, energy_kwh))
+        return remaining
+
     curve: list[tuple[datetime, float]] = []
     for slot_start, kw in slots:
         if kw <= 0 or slot_start + slot <= measured_to:

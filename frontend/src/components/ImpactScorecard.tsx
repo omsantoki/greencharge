@@ -41,8 +41,11 @@ function fmtKg(value: number): string {
   return abs >= 100 ? snap(value, 0).toFixed(0) : snap(value, 1).toFixed(1);
 }
 
+/** The sign belongs in front of the symbol -- "-₹12.4", never "₹-12.4", as the driver app writes it. */
 function fmtInr(value: number): string {
-  return Math.abs(value) >= 100 ? inr.format(snap(value, 0)) : inrFine.format(snap(value, 1));
+  const shown = Math.abs(value) >= 100 ? snap(value, 0) : snap(value, 1);
+  const abs = Math.abs(shown) >= 100 ? inr.format(Math.abs(shown)) : inrFine.format(Math.abs(shown));
+  return `${shown < 0 ? '-' : ''}₹${abs}`;
 }
 
 function toneFor(value: number | null, decimals = 1): string {
@@ -112,7 +115,7 @@ export function ImpactScorecard({ data, className = '' }: Props) {
           />
           <Tile
             label="Cost saved"
-            value={noSessions || cost === null ? '–' : `₹${fmtInr(cost)}`}
+            value={noSessions || cost === null ? '–' : fmtInr(cost)}
             tone={noSessions ? 'text-slate-400' : toneFor(cost)}
           />
           <Tile
