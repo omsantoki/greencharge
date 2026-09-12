@@ -5,11 +5,15 @@
  * dashboard never hard-codes a host. Every request carries a 10 s AbortSignal timeout and
  * throws `ApiError` on a non-2xx response or a network failure.
  *
- * The response types below mirror the live Phase 4 API shapes field for field. Do not add
- * a field the backend does not send.
+ * The response types below mirror the live Phase 4 and Phase 6 API shapes field for field. Do not
+ * add a field the backend does not send.
  */
 
-/** Request timeout. The slowest endpoint (POST /api/optimizer/weights) re-ticks the optimizer. */
+/**
+ * Request timeout. The slowest endpoints re-tick the optimizer (POST /api/optimizer/weights) or
+ * wait on the charge point (POST /api/debug/plug-in, whose own server-side budget is 15 s — a
+ * plug-in that hangs surfaces here as a network-error timeout rather than the server's 504).
+ */
 export const REQUEST_TIMEOUT_MS = 10_000;
 
 /** `ApiError.status` when the request never produced an HTTP response (offline, DNS, timeout). */
@@ -147,6 +151,66 @@ export type OverrideResponse = {
   session_id: number;
   limit_w: number;
   status: string;
+};
+
+/** GET /api/vehicles — the catalogue from data/vehicles.json. The driver form never invents car data. */
+export type Vehicle = {
+  model: string;
+  battery_kwh: number;
+  max_ac_kw: number;
+  max_dc_kw: number;
+};
+
+/**
+ * GET /api/sessions/{id}/impact — one session's own savings, ETA and green/grey split.
+ * `eta` is null when the current plan never covers the remaining need.
+ * green/grey: metered energy delivered in slots whose CI is below the mean CI of the session's
+ * horizon counts as green — a presentation choice, not a measurement, and the UI says so.
+ */
+export type SessionImpact = {
+  session_id: number;
+  co2_saved_g: number;
+  cost_saved_inr: number;
+  co2_actual_g: number;
+  co2_baseline_g: number;
+  green_kwh: number;
+  grey_kwh: number;
+  eta: string | null;
+  projected_soc_at_deadline: number;
+  on_time: boolean;
+  energy_needed_kwh: number;
+  energy_delivered_kwh: number;
+};
+
+/**
+ * GET /api/sessions/{id}/override-preview — what "I'm leaving now" costs against the current plan,
+ * shown before the driver confirms. `limit_w` is the full power the override would command.
+ * Either ETA is null when that path never reaches the target.
+ */
+export type OverridePreview = {
+  session_id: number;
+  extra_co2_g: number;
+  extra_cost_inr: number;
+  eta_now: string | null;
+  eta_planned: string | null;
+  limit_w: number;
+};
+
+/** POST /api/debug/plug-in body. `soc_start`/`soc_target` are 0..1 fractions, target above start. */
+export type PlugInRequest = {
+  charger_id: number;
+  vehicle_model: string;
+  soc_start: number;
+  soc_target: number;
+  hours_until_departure: number;
+};
+
+/** POST /api/debug/plug-in — returns once StartTransaction has created the session. */
+export type PlugInResponse = {
+  session_id: number;
+  transaction_id: number | null;
+  charger_id: number;
+  ocpp_id: string;
 };
 
 /* ------------------------------------------------------------------ errors */
@@ -349,6 +413,35 @@ export function postOverride(sessionId: number, signal?: AbortSignal): Promise<O
   );
 }
 
+/** The vehicle catalogue for the driver's plug-in form. */
+export function getVehicles(signal?: AbortSignal): Promise<Vehicle[]> {
+  return getJson<Vehicle[]>('/api/vehicles', signal);
+}
+
+/** One session's savings, ETA and green/grey split. Throws ApiError(404) for an unknown session. */
+export function getSessionImpact(sessionId: number, signal?: AbortSignal): Promise<SessionImpact> {
+  return getJson<SessionImpact>(
+    `/api/sessions/${encodeURIComponent(String(sessionId))}/impact`,
+    signal,
+  );
+}
+
+/** The cost of overriding, to show before the driver confirms. Throws ApiError(404) when unknown. */
+export function getOverridePreview(
+  sessionId: number,
+  signal?: AbortSignal,
+): Promise<OverridePreview> {
+  return getJson<OverridePreview>(
+    `/api/sessions/${encodeURIComponent(String(sessionId))}/override-preview`,
+    signal,
+  );
+}
+
+/** Plug a car in. Resolves once the charge point's StartTransaction has created the session. */
+export function postPlugIn(body: PlugInRequest, signal?: AbortSignal): Promise<PlugInResponse> {
+  return postJson<PlugInResponse>('/api/debug/plug-in', body, signal);
+}
+
 /** Alias of {@link postWeights}. */
 export const setWeights = postWeights;
 /** Alias of {@link postOverride}. */
@@ -367,6 +460,10 @@ export const api = {
   getOcppLog,
   postWeights,
   postOverride,
+  getVehicles,
+  getSessionImpact,
+  getOverridePreview,
+  postPlugIn,
 };
 
 export default api;

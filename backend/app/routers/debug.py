@@ -7,6 +7,8 @@
                                     with SetChargingProfile {"status", "session_id", "limit_w"}
     GET  /api/ocpp/log?limit=50  -> the most recent raw OCPP-J frames, newest first
     GET  /api/clock              -> the simulation clock {"now", "time_scale"}
+    GET  /api/vehicles           -> the vehicle catalogue (Phase 6: the driver's plug-in form
+                                    picks a car from it instead of hard-coding car data)
 
 Both POST bodies are read with ``parse_json_body``, so they work without a Content-Type header.
 
@@ -384,3 +386,15 @@ async def ocpp_log(limit: Annotated[int, Query(ge=1)] = 50) -> list[dict[str, An
 async def sim_clock() -> dict[str, Any]:
     """The simulation clock: ``now`` (ISO-8601, UTC) and ``time_scale`` (sim s per real s)."""
     return {"now": clock.now().isoformat(), "time_scale": clock.time_scale}
+
+
+# Plain `def` (not async): reading the catalogue file is blocking, so FastAPI runs this in its
+# threadpool rather than on the event loop the CSMS shares.
+@router.get("/vehicles")
+def vehicles() -> list[dict[str, Any]]:
+    """The vehicle catalogue of data/vehicles.json, in file order:
+    ``[{"model", "battery_kwh", "max_ac_kw", "max_dc_kw"}]``.
+
+    The same models POST /api/debug/plug-in accepts as ``vehicle_model``.
+    """
+    return load_vehicles()

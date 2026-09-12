@@ -40,6 +40,17 @@ Override errors (never a 500):
 When the charge point does not accept the profile, the manual limit this request set is removed
 again, so the orchestrator keeps planning the session as before.
 
+Phase 6 (the driver PWA) adds the same session's own numbers:
+
+    GET /api/sessions/{session_id}/impact           -> the session's savings, ETA, projected SoC
+        at the deadline and green/grey kWh split (``accounting.session_impact``).
+    GET /api/sessions/{session_id}/override-preview -> what "I'm leaving now" would add in CO2
+        and rupees, and the two arrival times (``accounting.override_preview``). It only reads:
+        the override itself is still the POST above.
+
+Both answer 404 for an unknown session and 503 when no carbon forecast is cached to price the
+charging with, exactly as GET /api/impact/summary does.
+
 These endpoints are ``async`` and run on the event loop the CSMS and the tick scheduler share:
 the OCPP connections and ``registry.manual_limits_w`` belong to that loop. Everything that
 queries the database, including the orchestrator's ``get_latest_schedules()``, runs in a worker
@@ -48,7 +59,8 @@ thread, so a slow or unreachable database cannot stall the loop.
 import asyncio
 import json
 import logging
-from datetime import timezone
+from collections.abc import Callable
+from datetime import datetime, timezone
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
@@ -56,11 +68,14 @@ from ocpp.v16.enums import ChargingProfileStatus
 from sqlalchemy import inspect, select
 from sqlalchemy.orm import Session as DbSession
 
+from app.clock import clock
 from app.db import SessionLocal, get_db
 from app.models import Charger, MeterValue, Session
 from app.ocpp import registry
 from app.ocpp.handlers import STATUS_CALL_ERROR, STATUS_ERROR, STATUS_TIMEOUT
+from app.orchestrator import accounting
 from app.orchestrator import loop as orchestrator
+from app.providers import ProviderError
 from app.routers import parse_json_body
 from app.schemas import ActiveSessionOut, OverrideRequest, SessionScheduleOut
 
@@ -291,3 +306,49 @@ async def override_session(session_id: int, request: Request) -> dict[str, Any]:
         "Override on %s: session %d charges at max now (%g W)", ocpp_id, session_id, limit_w
     )
     return {"session_id": session_id, "limit_w": limit_w, "status": str(status)}
+
+
+# --------------------------------------------------------------------------------------------
+# Phase 6 (driver PWA): one session's own numbers
+# --------------------------------------------------------------------------------------------
+
+
+def _session_view(
+    compute: Callable[[DbSession, Session, datetime, dict | None], dict],
+    session_id: int,
+    now: datetime,
+) -> dict[str, Any] | None:
+    """``compute(db, session, now, latest_plan)`` for one session, or None when there is no such
+    session. Blocking (the latest plans and the database); run in a worker thread."""
+    plan = orchestrator.get_latest_schedules().get(session_id)
+    with SessionLocal() as db:
+        session = db.get(Session, session_id)
+        if session is None:
+            return None
+        return compute(db, session, now, plan)
+
+
+async def _session_view_response(
+    compute: Callable[[DbSession, Session, datetime, dict | None], dict], session_id: int
+) -> dict[str, Any]:
+    try:
+        result = await asyncio.to_thread(_session_view, compute, session_id, clock.now())
+    except ProviderError as exc:
+        logger.warning("Session %d: %s", session_id, exc)
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    if result is None:
+        raise HTTPException(status_code=404, detail=f"Session {session_id} not found")
+    return result
+
+
+@router.get("/sessions/{session_id}/impact")
+async def session_impact(session_id: int) -> dict[str, Any]:
+    """The session's savings, ETA, projected SoC at the deadline and green/grey kWh split."""
+    return await _session_view_response(accounting.session_impact, session_id)
+
+
+@router.get("/sessions/{session_id}/override-preview")
+async def session_override_preview(session_id: int) -> dict[str, Any]:
+    """What overriding this session ("charge at max now") would add in CO2 and rupees, and the
+    arrival time it would give, against the plan the session is following. Reads only."""
+    return await _session_view_response(accounting.override_preview, session_id)

@@ -479,6 +479,110 @@ slot boundary smears energy across it and a past slot can still read a few tenth
 40 kW limit (about 1%) even though every commanded limit, and every planned slot, is at or below it. The dashboard shows this honestly — the peak turns red — and
 annotates it `(metered — planned peak N kW)` so the plan and the measurement are not confused.
 
+## Driver app (Phase 6)
+
+The phone view lives at <http://localhost:5173/driver> — one page,
+`frontend/src/pages/DriverApp.tsx`, built for a 390 px viewport. It runs on the stack the
+[operator dashboard](#operator-dashboard-phase-5) already needs; nothing extra has to be started.
+It is the same backend, the same simulated clock and the same accounting as the dashboard, cut down
+to one driver's car, and it invents nothing: every figure on it is a field an API returned and the
+browser only formats (grams → kilograms, watts → kilowatts, fractions → percentages). There is no
+LLM in it — the plain-language explanation is assembled from the API's own values, sentence by
+sentence. The session id is kept in `localStorage`, so a refresh, or a phone locking mid-charge,
+comes back to the same car.
+
+### The four screens
+
+1. **Plug in** — the chargers that are actually free (`status` `Available` with a heartbeat, from
+   `GET /api/sites`), the cars from `GET /api/vehicles`, a current-charge slider, a target slider
+   (always kept above the current charge) and a departure time. The departure is a time of day: it
+   is converted to `hours_until_departure` against the **simulated** clock (`GET /api/clock`) and
+   rolls to tomorrow when that time has already gone past today. Submitting calls
+   `POST /api/debug/plug-in`, the same endpoint the demo scenarios use.
+2. **Your plan** — the target and the ETA, a one-row carbon strip (the same green→amber→red scale
+   as the operator Gantt, with this car's blocks, a "now" line and a dashed departure line), the
+   CO₂ and ₹ saved, and the plain-language explanation.
+3. **Live** — the current power, an SoC ring against the target, the green/grey kWh split and the
+   running savings. Polls at the 3 s floor the dashboard uses.
+4. **Override** — a red "I'm leaving now" button in a bar pinned to the bottom of both screens, so
+   it is reachable without scrolling.
+
+### The three new endpoints
+
+- `GET /api/vehicles` — the list from `backend/app/data/vehicles.json`
+  (`{model, battery_kwh, max_ac_kw, max_dc_kw}` per car), so the plug-in form never hard-codes car
+  data.
+- `GET /api/sessions/{id}/impact` — one session's version of the impact summary:
+  `{session_id, co2_saved_g, cost_saved_inr, co2_actual_g, co2_baseline_g, green_kwh, grey_kwh,
+  eta, projected_soc_at_deadline, on_time, energy_needed_kwh, energy_delivered_kwh}`.
+- `GET /api/sessions/{id}/override-preview` — `{session_id, extra_co2_g, extra_cost_inr, eta_now,
+  eta_planned, limit_w}`: what charging at full power from now would **add**, against the plan the
+  car is following. It only reads; the override itself is still the Phase 4 POST.
+
+Both per-session endpoints answer 404 for a session that does not exist, and 503 when no carbon
+forecast is cached for the site's zone — the same rule as `GET /api/impact/summary`. The savings
+follow that summary exactly, so the per-session figures add up to it: a session that has finished
+is baseline − actual, an active one is baseline − (delivered + the rest of its plan priced with the
+forecast). `eta` is the end of the planned slot at which the plan first covers the energy still
+needed; it is `null` when the plan never covers it, and also when no energy is needed any more —
+there is no arrival left to wait for.
+
+### Green and grey kWh — a presentation choice, not a measurement
+
+The Live screen splits the energy the car has drawn into "cleaner grid" and "dirtier grid". The
+rule is: **metered** energy delivered in a 15-minute slot whose carbon intensity is *below the mean
+carbon intensity over that session's own window* (plug-in slot to departure slot) counts as green,
+the rest as grey. No grid tells anyone which electrons were renewable; this only says "cleaner than
+this car's average hour, or not", and the screen says so in those words. Two consequences worth
+knowing: the split uses the cached **forecast** carbon intensity, which under the default
+`GRID_PROVIDER=synthetic` is the same deterministic curve the actual accounting uses; and it sums
+to what the meter has reported, which is `energy_delivered_kwh` except for the final
+StopTransaction reading of a session that has just ended, so on a finished car the two halves can
+add up a hair under the delivered figure.
+
+### The override, and what it really does
+
+"I'm leaving now" takes **two taps**, because it costs something and the driver should see what.
+
+1. The first tap only calls `GET /api/sessions/{id}/override-preview` and shows the four numbers it
+   returns: the extra CO₂, the extra rupees, the arrival time charging now would give and the one
+   the green plan gives. Both sides are priced with the same cached forecast and the same tariff
+   the optimizer plans with — nothing is estimated in the browser. "Keep my green plan" sends
+   nothing.
+2. The second, red tap calls `POST /api/sessions/{id}/override` — the Phase 4 endpoint — which sets
+   the session's manual limit to the car's full power in watts and sends the charge point a
+   `SetChargingProfile` immediately. The screen then shows the limit the charger accepted.
+
+From that moment the session is out of the linear program (see
+[Manual limits](#orchestration-phase-4)): the orchestrator re-sends that limit every tick and never
+re-plans the car, its draw is subtracted from the site limit the other cars share, and the app
+reads the override back from `manual_limit_w` on `GET /api/sessions/active` rather than remembering
+it locally. The site limit still holds — the override takes its kilowatts out of the other cars'
+share, not out of the transformer.
+
+### Acceptance at 390 px
+
+The Phase 6 acceptance is visual: on a 390 px viewport, plug a car in, receive a plan, watch it
+charge, press the override and confirm in `GET /api/ocpp/log` that the charger jumps to full power
+within one tick. One caveat about the tooling: on this machine headless Chrome will not open a
+window narrower than about 500 px, so
+`--headless=new --window-size=390,844 --screenshot` renders the page at 500 px and saves a 390 px
+**crop** of it — a perfectly good layout then looks cut off on the right. For a true 390 px
+viewport drive Chrome over CDP with
+`Emulation.setDeviceMetricsOverride {width: 390, height: 844, deviceScaleFactor: 2, mobile: true}`.
+
+### Honest states
+
+- **Power now** is a commanded limit, not a metered draw — the override limit while overridden, and
+  otherwise the plan's power for the current 15-minute slot. Each is labelled as what it is, the
+  same way the dashboard's charger cards are.
+- **Savings wait for the plan.** In the few seconds between the plug-in and the first tick a
+  session has no schedule, so the API's saving is the whole baseline (there is no remaining plan to
+  subtract from it). The screens show `—` and "once the plan arrives" until the first plan lands,
+  rather than a figure that would immediately collapse.
+- When a feed fails the last good values stay on screen under a "Connection lost" banner, exactly
+  like the dashboard.
+
 ## Decisions & deviations
 
 Decisions (2026-09-11) that refine or deviate from the spec, and known limitations:
@@ -596,6 +700,33 @@ Phase 4 (orchestration):
   reset stopped the transactions still sends its (0 W) profiles, and the chargers answer `Rejected`
   because their transactions have just ended. It is logged and harmless.
 
+Phase 6 (driver app):
+
+- **One new file**, `frontend/src/pages/DriverApp.tsx` (user-approved). The spec gives Phase 6 no
+  file manifest. The backend added no file at all: `GET /api/vehicles` went into
+  `backend/app/routers/debug.py`, the two per-session endpoints into
+  `backend/app/routers/sessions.py`, and the numbers behind them into
+  `backend/app/orchestrator/accounting.py`. `frontend/src/App.tsx` gained the `/driver` route and
+  `frontend/src/api/client.ts` the four calls. No new npm package, no service worker, no offline
+  caching and no auth — the spec's "smaller than Phase 5".
+- **The green/grey split is a presentation choice**, not a measurement, and it is scored with the
+  cached forecast carbon intensity (see [Green and grey kWh](#green-and-grey-kwh--a-presentation-choice-not-a-measurement)).
+  Under the default `GRID_PROVIDER=synthetic` the forecast and the actual curve are the same
+  deterministic profile, so the two agree; with a provider whose forecast differs from what
+  happened, a delivered slot older than the oldest cached forecast point is scored with the
+  nearest cached value.
+- **The driver's "power now" is a commanded limit, not a meter reading.** The streaming meter feed
+  (`GET /api/sessions/{id}/meter-values`) is not consumed by the phone view; it shows the override
+  limit while overridden and the plan's current slot otherwise, labelled either way.
+- **Headless Chrome cannot open a 390 px window on this machine** — `--window-size=390,844` renders
+  at about 500 px and crops. Use CDP `Emulation.setDeviceMetricsOverride` for a true 390 px check.
+- **A slow plug-in can surface as a network error.** The frontend's request timeout is 10 s
+  (`REQUEST_TIMEOUT_MS`, shared by every call since Phase 5) while the backend allows the plug-in
+  handshake 15 s, so a plug-in that takes longer than 10 s but still succeeds reaches the app as a
+  timeout rather than the server's own message. After a timeout — never after a refusal such as the
+  409 for a busy charger — the form looks for an active session on the same charger, with the same
+  car and the same starting charge, and adopts it instead of stranding the driver.
+
 ## Phase status
 
 - Phase 0 — Scaffold: acceptance passed (`/health` reports db and redis true; page reads "GreenCharge")
@@ -609,3 +740,7 @@ Phase 4 (orchestration):
   run: no blocks in the red evening band, the baseline crossing the 40 kW limit line while the plan
   stays on it, CO₂ and ₹ savings non-zero, live OCPP frames, and the α/β sliders visibly reshaping
   the plan). See [Operator dashboard](#operator-dashboard-phase-5).
+- Phase 6 — Driver PWA: acceptance passed (at a 390 px viewport: plug in, receive a plan, watch it
+  charge, then override — a car the optimizer had paused at 0 kW was commanded to its full 11 kW
+  within one tick, with the other five cars left paused and the site limit still respected). See
+  [Driver app](#driver-app-phase-6).
