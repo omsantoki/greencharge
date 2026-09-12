@@ -9,8 +9,9 @@ and site data over HTTP), Phase 2 (the OCPP layer: an OCPP 1.6J server inside th
 six simulated chargers that obey remote power limits), Phase 3 (the optimizer: a linear program
 that plans each car's charging power for the next 24 hours) and Phase 4 (orchestration: a control
 loop that runs the optimizer on the live sessions, pushes the result to the chargers as OCPP
-charging profiles, and accounts for the CO₂ and money saved against a naive-charging baseline).
-There is no dashboard yet; everything is driven over the API.
+charging profiles, and accounts for the CO₂ and money saved against a naive-charging baseline) and
+Phase 5 (the operator dashboard: the single screen the demo runs on, described under
+[Operator dashboard](#operator-dashboard-phase-5)).
 
 ## Prerequisites
 
@@ -69,6 +70,14 @@ API keys go in `.env` only, never in code or git (`.env` is gitignored). No keys
    ```bash
    cd frontend
    npm run dev
+   ```
+
+   The dev server proxies `/api` and `/health` to `http://localhost:8000`. To point it at a backend
+   on another port, set `VITE_API_TARGET` (see
+   [Operator dashboard](#operator-dashboard-phase-5)):
+
+   ```bash
+   VITE_API_TARGET=http://localhost:18907 npm run dev -- --port 5187
    ```
 
 4. Simulated chargers, from the repository root in another terminal, using the venv:
@@ -310,8 +319,8 @@ construction; the code paths are still separate, and only a real provider would 
 
 **Load curve** (`GET /api/sites/{id}/load-curve`) is 96 slots from the site's earliest non-aborted
 plug-in. `baseline_kw` is the sum of every session's naive profile. `optimized_kw` is measured for
-slots that have already ended — the mean metered power of each session in that slot — and planned
-for the current and later slots. Both peaks are returned, which is what shows that the coordinated
+slots that have already ended — each session's metered energy for the slot divided by the slot
+length — and planned for the current and later slots. Both peaks are returned, which is what shows that the coordinated
 load stays under the site limit while the naive one would not.
 
 ### Endpoints
@@ -353,6 +362,122 @@ At `TIME_SCALE=60` the scenario spans about 45 real seconds. What it shows: a **
 peak of 40.0 kW** that never crosses it, all the charging moved into the 00:00–05:00 IST window
 where the carbon intensity is lowest, and about 11–12 kg of CO₂ and about ₹200 saved across the
 six cars, with every car still reaching 80 % before 07:00.
+
+## Operator dashboard (Phase 5)
+
+The dashboard is the screen the demo runs on: one page at `http://localhost:5173/` that shows what
+the optimizer is doing to the site right now. It is read-only apart from the optimizer-weight
+sliders, and it invents nothing — every number and every timestamp on it comes from the API.
+
+### Run it
+
+Start the four pieces in this order (each in its own terminal, from the repository root; the venv
+and `npm install` are covered under [One-time setup](#one-time-setup)):
+
+```bash
+docker compose up -d --wait                                   # Postgres 5435, Redis 6379
+(cd backend && ../.venv/bin/python -m app.seed)               # 1 site, CP001…CP006 (idempotent)
+(cd backend && ../.venv/bin/uvicorn app.main:app --port 8000) # API + the OCPP server on 9000
+.venv/bin/python simulator/run.py --chargers 6                # the six simulated charge points
+(cd frontend && npm run dev)                                  # the dashboard on 5173
+```
+
+Open <http://localhost:5173/>. With no cars plugged in the page explains itself and shows the live
+carbon forecast; then run the headline scenario and watch it fill (about 45 real seconds):
+
+```bash
+.venv/bin/python scripts/demo_scenario.py --scenario evening_rush
+```
+
+At `TIME_SCALE=60` one real second is one simulated minute, so the six cars plug in between 18:30
+and 19:15 simulated time and the interesting window — the 00:00–05:00 charging burst — arrives
+about five real minutes later. The header clock shows where the simulation has got to.
+
+**`VITE_API_TARGET`** overrides the dev server's proxy target (it defaults to
+`http://localhost:8000`), so a second backend on another port can be driven from its own dashboard
+without editing anything:
+
+```bash
+cd frontend
+VITE_API_TARGET=http://localhost:18907 npm run dev -- --port 5187 --strictPort
+```
+
+It is read in `frontend/vite.config.ts` and applies to both the `/api` and `/health` proxies. The
+browser only ever requests relative URLs, so no host is baked into the frontend code.
+
+### What each panel shows
+
+| Panel | Source | What it tells you |
+|---|---|---|
+| Header | `/api/clock`, `/api/sites`, `/api/grid/latest` | Site, grid zone, site limit, charger count, the simulated clock with its `TIME_SCALE`, the grid-data source badge, and a live/stale dot. An API-down banner appears here rather than a blank page. |
+| Impact so far | `/api/impact/summary` | CO₂ saved (kg), ₹ saved, and sessions on time out of the total, against the naive "charge at full power on arrival" baseline. The caption states the projection: active sessions count their remaining plan, so part of the figure is not yet delivered. With no sessions it shows `–`, never a zero dressed up as an achievement. |
+| Grid carbon intensity | `/api/grid/latest`, `/api/grid/forecast` | The current carbon intensity, the timestamp of the reading, and where it sits on the next 24 hours' range (cleanest → dirtiest), coloured on the same scale as the Gantt. |
+| Optimizer weights | `POST /api/optimizer/weights` | α (carbon) and β (money) for the objective `Σ p·Δt·(α·carbon/1000 + β·tariff)`, plus the status, solve time, session count and timestamp of the tick the change produced. `defaults` restores α 1.00 / β 0.001 — the β slider's 0.005 step cannot return to 0.001 on its own. |
+| Charging plan (the Gantt) | `/api/sessions/active`, `/api/grid/forecast` | The hero panel — see below. |
+| Site load | `/api/sites/{id}/load-curve` | The optimized site load against the naive baseline, with a red dashed line at the site's `max_power_kw` and the over-limit region shaded. The baseline visibly crosses the limit; the plan does not. |
+| Chargers | `/api/sites`, `/api/sessions/active` | The six charge points: OCPP status, the car on them, SoC against target and deadline, the heartbeat age in real seconds, and the limit the CSMS has pushed for the current slot — labelled `planned` or `override`, because it is a commanded setpoint and not a meter reading. A car whose plan gives it 0 kW in the current slot reads `holding · from HH:MM`, not `0.0 kW`, so a deliberate pause never looks like a fault. |
+| OCPP 1.6-J frames | `/api/ocpp/log?limit=50` | The raw JSON frames on the wire, newest first, capped at 50, inbound and outbound colour-coded and labelled, each with its time, direction, charge point and the frame verbatim. |
+
+### The Gantt, and its colour scale
+
+`frontend/src/components/ScheduleGantt.tsx` is hand-rolled SVG — no chart library, per the spec.
+The X axis is the 96 quarter-hour slots of the horizon, taken from the forecast's own timestamps,
+with hour labels every fourth slot.
+
+- **Background:** one `<rect>` per slot, no stroke, drawn at 0.45 opacity so blocks stay legible.
+  The fill is a three-stop scale interpolated in RGB — green `#16a34a` at the horizon's lowest
+  carbon intensity, amber `#f59e0b` at its mean, red `#dc2626` at its highest. The scale therefore
+  spans the horizon's own range, and the legend prints that range in gCO₂eq/kWh.
+- **Blocks:** one row per active session, solid slate `#0f172a`, opacity `power_kw / max_charge_kw`
+  with a floor of 0.15 so a small power is still visible.
+- **Markers:** a vertical "now" line from the simulated clock (labelled below the band, so it never
+  covers a row), and a dashed tick at each session's departure deadline — the reason a plan stops
+  where it does instead of reaching a cleaner window later in the day. The time after a car's
+  departure is greyed out on that car's row ("car has left — not chargeable" in the legend), so it
+  is obvious that an empty green window later in the day was simply out of reach.
+- **Hover:** any slot shows the slot's local time range, the planned kW and the carbon intensity.
+
+The claim the panel has to make at a glance is "the charging is avoiding the red parts". On
+`evening_rush` the reddest stretch is the 18:00–22:00 evening peak, and no block is drawn there;
+the blocks sit in the cleanest window every car can still reach before its 07:00 departure. The
+genuinely green midday window is after every deadline, which is what the deadline tick explains.
+
+### Live data, polling and time
+
+- `frontend/src/hooks/useLiveData.ts` polls on a timer, **never faster than every 3 seconds** — the
+  interval is clamped to a 3 s floor in the hook itself, so no caller can poll harder. The panels
+  poll at 3 s; the 24-hour carbon forecast, which advances one 15-minute slot at a time, polls at
+  15 s. A request is never started while the previous one is in flight, the timer is cleared on
+  unmount, and the last good data stays on screen when a request fails (the header dot turns stale
+  and a banner names the failing feeds).
+- Moving a weight slider is not polling: the POST is debounced ~300 ms, the backend re-runs the tick
+  before it replies, and the page then refetches the four feeds that a re-plan changes so the Gantt
+  reshapes within a few seconds.
+- There are no animations anywhere, and each panel sits in a fixed-height slot so arriving data
+  cannot move the page.
+- Every timestamp comes from the API and is simulated time, formatted in `Asia/Kolkata`. The browser
+  clock is never read — including for the Gantt's "now" line, which is `GET /api/clock`.
+
+### The "estimated" rule
+
+`GRID_PROVIDER=synthetic` is the default, and its carbon intensities are modelled, not measured. So
+wherever a grid value appears with `source === "estimated"` the UI says so and never presents it as
+a reading: an amber `GRID DATA: ESTIMATED` badge in the header, an `estimated` chip on the carbon
+gauge, and an `ESTIMATED — synthetic grid profile, not measured` note beside the Gantt's legend. If
+the provider is ever switched to Electricity Maps, those badges print the real source string
+instead. The same honesty applies to power: the charger cards label their kW `planned` or
+`override` because it is the limit pushed over OCPP, not metered draw.
+
+### Known limitation — the metered part of the load curve
+
+Slots that have already ended are metered, not planned: per session, the backend takes the energy
+its meter register gained during the slot and divides by the slot length, spreading each reading
+period across the slots it spans in proportion to the time spent in each. A charge point reports
+every 10 real seconds, which at `TIME_SCALE=60` is one reading per 10 simulated minutes against a
+15-minute slot, and the plan can switch every 5 simulated minutes — so a reading period straddling a
+slot boundary smears energy across it and a past slot can still read a few tenths of a kW above the
+40 kW limit (about 1%) even though every commanded limit, and every planned slot, is at or below it. The dashboard shows this honestly — the peak turns red — and
+annotates it `(metered — planned peak N kW)` so the plan and the measurement are not confused.
 
 ## Decisions & deviations
 
@@ -452,11 +577,12 @@ Phase 4 (orchestration):
   optimized line sums the latest plan of the sessions that are still `active`. A completed session's
   last plan is left out, because that car has gone; it is already represented by its metered power in
   the slots that have ended.
-- **Past slots on the load curve are sampled, not integrated.** A past slot's optimized value is the
-  mean of the meter readings inside it. At `TIME_SCALE=60` a 15-minute slot holds only one or two
-  readings per car, so the line approximates the slot's average power and the optimized peak can
-  read a little above the site limit even though no instant exceeded it. The plan itself (and every
-  limit actually sent) always respects the limit.
+- **Past slots on the load curve are limited by metering resolution.** A past slot's optimized value
+  integrates each car's metered energy over the slot (reading periods are split across slot
+  boundaries by time). At `TIME_SCALE=60` a car reports once per 10 simulated minutes while the plan
+  can change every 5, so a straddling reading period smears energy between slots and the optimized
+  peak can read roughly 1% above the site limit even though no instant exceeded it. The plan itself
+  (and every limit actually sent) always respects the limit.
 - **`StatusNotification(Available)` aborts a lost session only on a real connector.** A charge point
   reporting `Available` on connector 1 while a session is still active has lost that transaction (the
   simulator restarted, say), so the session is marked `aborted`. Connector 0 is excluded: in OCPP 1.6
@@ -479,3 +605,7 @@ Phase 4 (orchestration):
 - Phase 4 — Orchestration: acceptance passed (`evening_rush`: 11.86 kg CO₂ saved, ₹201 saved, 6/6
   sessions on time, optimized peak 40.0 kW against a baseline peak of 46.8 kW and a 40 kW site limit;
   the commanded limit is 0 W through the evening peak and the energy lands in 00:00–05:00)
+- Phase 5 — Operator dashboard: acceptance passed (checked on screenshots of a live `evening_rush`
+  run: no blocks in the red evening band, the baseline crossing the 40 kW limit line while the plan
+  stays on it, CO₂ and ₹ savings non-zero, live OCPP frames, and the α/β sliders visibly reshaping
+  the plan). See [Operator dashboard](#operator-dashboard-phase-5).

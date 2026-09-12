@@ -271,8 +271,10 @@ def site_load_curve(
 
     - ``baseline_kw[t]``: sum of every session's ``baseline_power_profile`` at slot t.
     - ``optimized_kw[t]`` for a slot that ENDS <= now (``is_past``, actual): sum over sessions of
-      the mean ``power_kw`` of that session's meter values with ts in the slot (a session with no
-      reading in the slot adds 0).
+      the AVERAGE power the session drew in that slot, taken from its cumulative energy register
+      (Δenergy / slot hours; a session with no reading in the slot adds 0). Averaging the
+      instantaneous ``power_kw`` samples instead would let a slot holding one or two samples read
+      above a site limit the site never actually exceeded.
     - ``optimized_kw[t]`` for every other slot (plan): sum of the planned power at that
       slot_start in the latest schedule (``latest_schedules[id]["slots"]``, a list of
       ``(slot_start, kW)``) of each session that is still ACTIVE. A completed session charges no
@@ -317,19 +319,44 @@ def site_load_curve(
 
     # Past slots: actual, from the meter values.
     if sessions and n_past:
+        past_end = window_start + n_past * slot
+        slot_hours = slot.total_seconds() / 3600.0
         rows = db.execute(
-            select(MeterValue.session_id, MeterValue.ts, MeterValue.power_kw).where(
+            select(MeterValue.session_id, MeterValue.ts, MeterValue.energy_kwh)
+            .where(
                 MeterValue.session_id.in_([s.id for s in sessions]),
-                MeterValue.ts >= window_start,
-                MeterValue.ts < window_start + n_past * slot,
+                MeterValue.ts < past_end,
             )
+            .order_by(MeterValue.session_id, MeterValue.ts)
         ).all()
-        readings: dict[tuple[int, int], list[float]] = defaultdict(list)
+        readings: dict[int, list[tuple[datetime, float]]] = defaultdict(list)
         for row in rows:
-            index = (_utc(row.ts, "meter value ts") - window_start) // slot
-            readings[(row.session_id, index)].append(float(row.power_kw))
-        for (_, index), values in readings.items():
-            optimized_kw[index] += sum(values) / len(values)
+            readings[row.session_id].append(
+                (_utc(row.ts, "meter value ts"), float(row.energy_kwh))
+            )
+        for session in sessions:
+            # Each reading closes an interval that began at the previous reading (or at plug-in,
+            # where the register is 0). A reading period need not line up with the 15-minute slots,
+            # so spread the interval's energy across the slots it covers in proportion to the time
+            # it spent in each. Crediting it all to the slot holding the later reading would let a
+            # slot collect two reading periods and read up to a third above the real power.
+            previous_ts = _utc(session.plugged_in_at, "plugged_in_at")
+            previous_kwh = 0.0
+            for ts, energy_kwh in readings.get(session.id, ()):
+                delivered_kwh = energy_kwh - previous_kwh
+                span_s = (ts - previous_ts).total_seconds()
+                if delivered_kwh > 0.0 and span_s > 0.0:  # a register reset would read negative
+                    first = max(0, math.floor((previous_ts - window_start) / slot))
+                    last = min(n_past, math.ceil((ts - window_start) / slot))
+                    for index in range(first, last):
+                        slot_from = window_start + index * slot
+                        overlap_s = (
+                            min(ts, slot_from + slot) - max(previous_ts, slot_from)
+                        ).total_seconds()
+                        if overlap_s > 0.0:
+                            share = delivered_kwh * (overlap_s / span_s)
+                            optimized_kw[index] += share / slot_hours
+                previous_ts, previous_kwh = ts, energy_kwh
 
     # Current and future slots: the latest plan of each active session.
     for session in sessions:

@@ -1,0 +1,372 @@
+/**
+ * Typed HTTP client for the GreenCharge backend.
+ *
+ * Every URL is relative ("/api/..."): Vite proxies /api to the FastAPI server, so the
+ * dashboard never hard-codes a host. Every request carries a 10 s AbortSignal timeout and
+ * throws `ApiError` on a non-2xx response or a network failure.
+ *
+ * The response types below mirror the live Phase 4 API shapes field for field. Do not add
+ * a field the backend does not send.
+ */
+
+/** Request timeout. The slowest endpoint (POST /api/optimizer/weights) re-ticks the optimizer. */
+export const REQUEST_TIMEOUT_MS = 10_000;
+
+/** `ApiError.status` when the request never produced an HTTP response (offline, DNS, timeout). */
+export const NETWORK_ERROR_STATUS = 0;
+
+/* ------------------------------------------------------------------ response types */
+
+/** GET /api/clock — the simulation clock. `now` is ISO-8601 with offset; never the browser clock. */
+export type ClockInfo = {
+  now: string;
+  time_scale: number;
+};
+
+/** GET /api/grid/latest, GET /api/grid/forecast. `source` is "estimated" for the synthetic provider. */
+export type CarbonPoint = {
+  ts: string;
+  carbon_intensity: number;
+  renewable_pct: number | null;
+  fossil_pct: number | null;
+  source: string;
+};
+
+export type Charger = {
+  id: number;
+  site_id: number;
+  ocpp_id: string;
+  max_power_kw: number;
+  status: string;
+  last_heartbeat: string | null;
+};
+
+export type Site = {
+  id: number;
+  name: string;
+  latitude: number;
+  longitude: number;
+  grid_zone: string;
+  max_power_kw: number;
+  demand_charge_inr_per_kva: number;
+  chargers: Charger[];
+};
+
+/** One 15-minute planned slot. 96 of them make a horizon. */
+export type ScheduleSlot = {
+  slot_start: string;
+  power_kw: number;
+};
+
+/** GET /api/sessions/active. `schedule` holds 96 slots, or [] before the first tick. */
+export type ActiveSession = {
+  id: number;
+  charger_id: number;
+  ocpp_id: string;
+  ocpp_transaction_id: number | null;
+  vehicle_model: string;
+  battery_kwh: number;
+  max_charge_kw: number;
+  soc_start: number;
+  soc_target: number;
+  soc_current: number;
+  plugged_in_at: string;
+  deadline: string;
+  energy_delivered_kwh: number;
+  co2_actual_g: number;
+  co2_baseline_g: number;
+  cost_actual_inr: number;
+  cost_baseline_inr: number;
+  status: string;
+  manual_limit_w: number | null;
+  projected_unmet_kwh: number | null;
+  on_time: boolean;
+  schedule: ScheduleSlot[];
+};
+
+/** GET /api/sessions/{id}/schedule */
+export type SessionSchedule = {
+  session_id: number;
+  computed_at: string;
+  slots: ScheduleSlot[];
+};
+
+export type LoadCurveSlot = {
+  slot_start: string;
+  optimized_kw: number;
+  baseline_kw: number;
+  is_past: boolean;
+};
+
+/** GET /api/sites/{id}/load-curve */
+export type LoadCurve = {
+  site_id: number;
+  max_power_kw: number;
+  window_start: string;
+  now: string;
+  optimized_peak_kw: number;
+  baseline_peak_kw: number;
+  slots: LoadCurveSlot[];
+};
+
+/** GET /api/impact/summary */
+export type ImpactSummary = {
+  co2_saved_kg: number;
+  cost_saved_inr: number;
+  sessions_on_time: number;
+  total_sessions: number;
+};
+
+/** GET /api/ocpp/log — raw OCPP-J frames, newest first. */
+export type OcppFrame = {
+  ts: string;
+  direction: 'in' | 'out';
+  ocpp_id: string;
+  frame: string;
+};
+
+/** The orchestrator tick returned by POST /api/optimizer/weights. Keys of `unmet_kwh` are session ids. */
+export type TickInfo = {
+  computed_at: string;
+  reason: string;
+  n_sessions: number;
+  status: string;
+  solve_ms: number;
+  unmet_kwh: Record<string, number>;
+};
+
+/** POST /api/optimizer/weights */
+export type WeightsResponse = {
+  alpha: number;
+  beta: number;
+  tick: TickInfo;
+};
+
+/** POST /api/sessions/{id}/override */
+export type OverrideResponse = {
+  session_id: number;
+  limit_w: number;
+  status: string;
+};
+
+/* ------------------------------------------------------------------ errors */
+
+/**
+ * A failed request. `status` is the HTTP status, or `NETWORK_ERROR_STATUS` (0) when the
+ * request never reached the server (offline, connection refused, 10 s timeout).
+ * `body` is the raw response text (or the failure description for a network error).
+ */
+export class ApiError extends Error {
+  readonly status: number;
+  readonly body: string;
+  readonly url: string;
+  /** `detail` lifted out of a FastAPI `{"detail": "..."}` body, when the body is one. */
+  readonly detail: string | null;
+
+  constructor(status: number, body: string, url = '') {
+    const detail = extractDetail(body);
+    const what = status === NETWORK_ERROR_STATUS ? 'network error' : `HTTP ${status}`;
+    super(`${what}${url ? ` for ${url}` : ''}${detail ? `: ${detail}` : ''}`);
+    this.name = 'ApiError';
+    this.status = status;
+    this.body = body;
+    this.url = url;
+    this.detail = detail;
+  }
+
+  /** True when the request never reached the backend — the dashboard shows its API-down banner. */
+  get isNetworkError(): boolean {
+    return this.status === NETWORK_ERROR_STATUS;
+  }
+}
+
+function extractDetail(body: string): string | null {
+  const trimmed = body.trim();
+  if (!trimmed.startsWith('{')) return trimmed ? trimmed.slice(0, 300) : null;
+  try {
+    const parsed = JSON.parse(trimmed) as { detail?: unknown };
+    if (typeof parsed.detail === 'string') return parsed.detail;
+    if (parsed.detail != null) return JSON.stringify(parsed.detail).slice(0, 300);
+  } catch {
+    /* not JSON — fall through to the raw text */
+  }
+  return trimmed.slice(0, 300);
+}
+
+/** True for the DOMException a caller's own AbortSignal raises (unmount, superseded request). */
+export function isAbortError(err: unknown): boolean {
+  return err instanceof Error && (err.name === 'AbortError' || err.name === 'CanceledError');
+}
+
+/* ------------------------------------------------------------------ transport */
+
+type Linked = { signal: AbortSignal; dispose: () => void };
+
+/**
+ * A signal that aborts after REQUEST_TIMEOUT_MS, or as soon as the caller's signal does.
+ * (AbortSignal.any is too new to rely on; this does the same job with one controller.)
+ */
+function linkSignals(external?: AbortSignal): Linked {
+  const controller = new AbortController();
+  const onExternalAbort = () => controller.abort();
+  const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+
+  if (external) {
+    if (external.aborted) controller.abort();
+    else external.addEventListener('abort', onExternalAbort, { once: true });
+  }
+
+  return {
+    signal: controller.signal,
+    dispose: () => {
+      clearTimeout(timer);
+      if (external) external.removeEventListener('abort', onExternalAbort);
+    },
+  };
+}
+
+async function request<T>(url: string, init: RequestInit = {}, external?: AbortSignal): Promise<T> {
+  // The timeout covers reading the body too, so it is only disposed once the text is in hand.
+  const link = linkSignals(external);
+  let response: Response;
+  let text: string;
+
+  try {
+    try {
+      response = await fetch(url, {
+        ...init,
+        signal: link.signal,
+        headers: { Accept: 'application/json', ...(init.headers ?? {}) },
+      });
+      text = await response.text();
+    } catch (err) {
+      // The caller cancelled (component unmounted): propagate the abort, it is not a failure.
+      if (external?.aborted) throw err;
+      throw new ApiError(
+        NETWORK_ERROR_STATUS,
+        link.signal.aborted
+          ? `request timed out after ${REQUEST_TIMEOUT_MS} ms`
+          : err instanceof Error
+            ? err.message
+            : String(err),
+        url,
+      );
+    }
+  } finally {
+    link.dispose();
+  }
+
+  if (!response.ok) throw new ApiError(response.status, text, url);
+  if (!text) return undefined as T;
+
+  try {
+    return JSON.parse(text) as T;
+  } catch {
+    throw new ApiError(response.status, `expected JSON, got: ${text.slice(0, 300)}`, url);
+  }
+}
+
+function getJson<T>(url: string, signal?: AbortSignal): Promise<T> {
+  return request<T>(url, { method: 'GET' }, signal);
+}
+
+function postJson<T>(url: string, body: unknown, signal?: AbortSignal): Promise<T> {
+  return request<T>(
+    url,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body ?? {}),
+    },
+    signal,
+  );
+}
+
+/* ------------------------------------------------------------------ endpoints */
+
+/** The simulation clock. Drives the "now" line and every axis label — never `Date.now()`. */
+export function getClock(signal?: AbortSignal): Promise<ClockInfo> {
+  return getJson<ClockInfo>('/api/clock', signal);
+}
+
+/** Carbon intensity for the current slot. */
+export function getGridLatest(signal?: AbortSignal): Promise<CarbonPoint> {
+  return getJson<CarbonPoint>('/api/grid/latest', signal);
+}
+
+/** Carbon forecast, `hours * 4` points at 15-minute spacing (24 h = the Gantt's 96 slots). */
+export function getGridForecast(hours = 24, signal?: AbortSignal): Promise<CarbonPoint[]> {
+  return getJson<CarbonPoint[]>(`/api/grid/forecast?hours=${encodeURIComponent(String(hours))}`, signal);
+}
+
+/** Every site with its chargers nested. */
+export function getSites(signal?: AbortSignal): Promise<Site[]> {
+  return getJson<Site[]>('/api/sites', signal);
+}
+
+/** Active sessions, each with its latest 96-slot plan attached. */
+export function getActiveSessions(signal?: AbortSignal): Promise<ActiveSession[]> {
+  return getJson<ActiveSession[]>('/api/sessions/active', signal);
+}
+
+/** The newest persisted plan for one session. Throws ApiError(404) when it has none yet. */
+export function getSessionSchedule(sessionId: number, signal?: AbortSignal): Promise<SessionSchedule> {
+  return getJson<SessionSchedule>(
+    `/api/sessions/${encodeURIComponent(String(sessionId))}/schedule`,
+    signal,
+  );
+}
+
+/** Optimized vs baseline aggregate kW for a site, 96 slots, plus both peaks and the site limit. */
+export function getLoadCurve(siteId: number, signal?: AbortSignal): Promise<LoadCurve> {
+  return getJson<LoadCurve>(
+    `/api/sites/${encodeURIComponent(String(siteId))}/load-curve`,
+    signal,
+  );
+}
+
+/** CO2 and rupees saved against the baseline, plus the on-time session count. */
+export function getImpactSummary(signal?: AbortSignal): Promise<ImpactSummary> {
+  return getJson<ImpactSummary>('/api/impact/summary', signal);
+}
+
+/** Raw OCPP frames, newest first (the backend keeps the most recent ones only). */
+export function getOcppLog(limit = 50, signal?: AbortSignal): Promise<OcppFrame[]> {
+  return getJson<OcppFrame[]>(`/api/ocpp/log?limit=${encodeURIComponent(String(limit))}`, signal);
+}
+
+/** Set the optimizer weights. The backend re-ticks immediately and returns that tick. */
+export function postWeights(alpha: number, beta: number, signal?: AbortSignal): Promise<WeightsResponse> {
+  return postJson<WeightsResponse>('/api/optimizer/weights', { alpha, beta }, signal);
+}
+
+/** Operator override: charge this session at full power now. */
+export function postOverride(sessionId: number, signal?: AbortSignal): Promise<OverrideResponse> {
+  return postJson<OverrideResponse>(
+    `/api/sessions/${encodeURIComponent(String(sessionId))}/override`,
+    {},
+    signal,
+  );
+}
+
+/** Alias of {@link postWeights}. */
+export const setWeights = postWeights;
+/** Alias of {@link postOverride}. */
+export const overrideSession = postOverride;
+
+/** Every endpoint in one object, for callers that prefer `api.getSites()`. */
+export const api = {
+  getClock,
+  getGridLatest,
+  getGridForecast,
+  getSites,
+  getActiveSessions,
+  getSessionSchedule,
+  getLoadCurve,
+  getImpactSummary,
+  getOcppLog,
+  postWeights,
+  postOverride,
+};
+
+export default api;
