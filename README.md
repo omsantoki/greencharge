@@ -7,11 +7,15 @@ starts only after the previous phase's acceptance test passes. So far it has Pha
 skeleton), Phase 1 (the data layer: database schema, seed data, and grid carbon-intensity, tariff
 and site data over HTTP), Phase 2 (the OCPP layer: an OCPP 1.6J server inside the API process and
 six simulated chargers that obey remote power limits), Phase 3 (the optimizer: a linear program
-that plans each car's charging power for the next 24 hours) and Phase 4 (orchestration: a control
+that plans each car's charging power for the next 24 hours), Phase 4 (orchestration: a control
 loop that runs the optimizer on the live sessions, pushes the result to the chargers as OCPP
-charging profiles, and accounts for the CO₂ and money saved against a naive-charging baseline) and
+charging profiles, and accounts for the CO₂ and money saved against a naive-charging baseline),
 Phase 5 (the operator dashboard: the single screen the demo runs on, described under
-[Operator dashboard](#operator-dashboard-phase-5)).
+[Operator dashboard](#operator-dashboard-phase-5)), Phase 6 (the driver PWA: the phone view at
+`/driver`, under [Driver app](#driver-app-phase-6)) and Phase 7 (the LLM layer: three narrow
+capabilities — reading a driver's own sentence into the plug-in form, narrating a plan already on
+screen, and an operator copilot over three fixed tools — none of which ever produces a number the
+UI shows, under [LLM layer](#llm-layer-phase-7)).
 
 ## Prerequisites
 
@@ -35,7 +39,9 @@ cp .env.example .env
 ```
 
 API keys go in `.env` only, never in code or git (`.env` is gitignored). No keys are needed to run:
-`GRID_PROVIDER` defaults to `synthetic`.
+`GRID_PROVIDER` defaults to `synthetic`, and with `LLM_API_KEY` empty the three Phase 7 endpoints
+answer 503 while every other feature behaves exactly as it does with a key
+(see [LLM layer](#llm-layer-phase-7)).
 
 ## Run
 
@@ -486,10 +492,13 @@ The phone view lives at <http://localhost:5173/driver> — one page,
 [operator dashboard](#operator-dashboard-phase-5) already needs; nothing extra has to be started.
 It is the same backend, the same simulated clock and the same accounting as the dashboard, cut down
 to one driver's car, and it invents nothing: every figure on it is a field an API returned and the
-browser only formats (grams → kilograms, watts → kilowatts, fractions → percentages). There is no
-LLM in it — the plain-language explanation is assembled from the API's own values, sentence by
-sentence. The session id is kept in `localStorage`, so a refresh, or a phone locking mid-charge,
-comes back to the same car.
+browser only formats (grams → kilograms, watts → kilowatts, fractions → percentages). Since Phase 7
+a model assists this screen in two places — it prefills the plug-in form from the driver's own
+sentence, and it narrates the plan — but it only ever assists: no number the driver reads comes out
+of its text, nothing is submitted on its say-so, and the explanation the browser assembles from the
+API's own values, sentence by sentence, is still what renders until (and if) the narration answers.
+See [LLM layer](#llm-layer-phase-7). The session id is kept in `localStorage`, so a refresh, or a
+phone locking mid-charge, comes back to the same car.
 
 ### The four screens
 
@@ -498,10 +507,19 @@ comes back to the same car.
    (always kept above the current charge) and a departure time. The departure is a time of day: it
    is converted to `hours_until_departure` against the **simulated** clock (`GET /api/clock`) and
    rolls to tomorrow when that time has already gone past today. Submitting calls
-   `POST /api/debug/plug-in`, the same endpoint the demo scenarios use.
+   `POST /api/debug/plug-in`, the same endpoint the demo scenarios use. Above those controls is a
+   free-text box — "leaving at 7am, need 80%", in English, हिंदी or ગુજરાતી — whose button calls
+   `POST /api/llm/extract` and moves the target slider and the departure picker to what the
+   sentence said, through the same handlers a finger uses. It prefills and stops there: the driver
+   reads both values back in an "Understood: 80% by 07:00" banner and still presses **Start
+   charging** themselves. Nothing read, 503 with no key, a 15 s timeout or an offline backend all
+   end in the same line, "Couldn't read that — set it below", with the form untouched.
 2. **Your plan** — the target and the ETA, a one-row carbon strip (the same green→amber→red scale
    as the operator Gantt, with this car's blocks, a "now" line and a dashed departure line), the
-   CO₂ and ₹ saved, and the plain-language explanation.
+   CO₂ and ₹ saved, and the plain-language explanation. The explanation starts as the browser's own
+   sentences and is replaced, once the optimizer has actually given this session a plan, by the
+   text `POST /api/llm/explain` returns — asked for once, not on a timer. If that call fails,
+   404s, 503s or times out, the browser's sentences simply stay.
 3. **Live** — the current power, an SoC ring against the target, the green/grey kWh split and the
    running savings. Polls at the 3 s floor the dashboard uses.
 4. **Override** — a red "I'm leaving now" button in a bar pinned to the bottom of both screens, so
@@ -582,6 +600,211 @@ viewport drive Chrome over CDP with
   rather than a figure that would immediately collapse.
 - When a feed fails the last good values stay on screen under a "Connection lost" banner, exactly
   like the dashboard.
+
+## LLM layer (Phase 7)
+
+Three narrow capabilities, in `backend/app/llm/` behind `backend/app/routers/llm.py`. Not a
+chatbot: each one does a single job, and the whole layer is the last item on the spec's cut list —
+the product works with it deleted.
+
+1. **Extract** (`extract.py`) — a driver's own sentence becomes the two values the plug-in form
+   asks for: a target state of charge and a departure time. It only ever **prefills** the form;
+   the driver reads the values back and submits them.
+2. **Explain** (`explain.py`) — a plan that is already on screen becomes two or three plain
+   sentences. Narration only.
+3. **Copilot** (`copilot.py`) — an operator question is answered from exactly three read-only
+   tools, all implemented in our own code: `query_sessions(filters)`,
+   `get_site_performance(site_id, days)` and `get_carbon_history(hours)`. There is no fourth tool,
+   no SQL from the model, and no free-form tool argument: each tool's arguments are a Pydantic
+   model with `extra="forbid"`, the tool name is a whitelist check, and at most two calls run.
+
+### THE RULE, and how it is enforced
+
+> **The LLM never produces a number that appears in the UI.** It receives pre-computed values and
+> narrates them. It classifies and extracts. It does not calculate.
+
+This is the spec's rule for Phase 7 and it is enforced structurally, not by asking nicely:
+
+- **The model is never shown raw data.** `explain.py` receives values the optimizer, the providers
+  and `orchestrator/accounting.py` already computed, formatted into display strings by our code
+  (`"3.2 kg"`, `"₹118"`, `"01:00-04:30 IST"`, `"80%"`) — never an array, a float or a timestamp.
+  The router gathers them; `explain.py` cannot reach the database, the providers or the clock at
+  all. The copilot's tools likewise return numbers that our code computed, rounded and formatted
+  (state of charge as a percentage, times already in site-local form, CO₂ in both g and kg) so the
+  model never converts a unit or a timezone. The carbon tool returns a summary of the curve, not
+  the curve.
+- **The system prompts forbid arithmetic** — no adding, averaging, unit conversion, working out a
+  duration, or counting the rows of a list.
+- **Every reply is parsed into a Pydantic model and thrown away if it does not validate.**
+  `ExtractedConstraints` bounds `target_soc` to 0–1 and `confidence` to three literals; a deadline
+  must parse, must be in the future of the *simulated* clock and must be within 14 days.
+- **Every number in a finished sentence is checked against the numbers we supplied.** In
+  `explain.py` the check is unit-aware: a figure written with a unit must match a fact carrying
+  *that* unit, so "saves 118 kg of CO₂ and ₹3.2" is rejected when the computed facts are `3.2 kg`
+  and `₹118` — both values were supplied, but neither with the unit it is written in. Lifting the
+  digits out of a car name (`XUV400` → "400 kg", with that car on the charger) and inventing
+  "999 kg" fail the same way, and so does any number written as a duration ("ready in about
+  3 hours"), because no fact is ever a duration and nothing can ground one. A quantity spelled out
+  in words is rejected too, by its own rule, since it carries no digits for the check above. The
+  copilot does the same against its tool payload. A rejected answer is asked for once more, and
+  then loses its turn.
+- **Extraction is not calculation.** Reading a stated target or deadline out of "I need 80% by 7am
+  tomorrow" is extraction, which the spec allows; the resulting values are bounded and re-emitted
+  in site-local time by our code.
+
+Its limits, stated plainly: the grounding check compares values, so a small integer the model
+derived itself (say, counting two completed sessions in a list) can still slip through when the
+same small integer appears elsewhere in the payload, and the copilot's check does not read numbers
+spelled out in words. Both are prompt-forbidden and neither was observed live, but the check is a
+backstop, not a proof.
+
+### The sentence to ask for: a car that will miss its target
+
+The easiest thing for a judge to probe, and the one place a narration could lie. `on_time` and
+`projected_soc_at_deadline` come out of `accounting.session_impact()` like every other number, and
+when `on_time` is false three things change at once — in our code, before the model is called:
+
+- the ETA is dropped from the facts. `accounting` already leaves it `null` for a plan that misses,
+  and `build_explain_facts` drops it again, so there is no finish time in the prompt to promise.
+- `projected_soc` is set, and *only* then: the charge the plan actually reaches by the deadline.
+- the prompt block carries the line `Reaches the charge target by the deadline: NO`, and the system
+  prompt requires the **first** sentence to say plainly that the car will not reach the target and
+  to give the charge it does reach — never a ready time, never softened into a maybe.
+
+The deterministic fallback says the same thing from the same fields (the `risk_*` templates in
+`explain.py`, in all three languages), because that text is what ships when the model call fails.
+The `tight_deadline` scenario produces this state on demand.
+
+### Configuration — the key lives in `.env` and nowhere else
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `LLM_PROVIDER` | `gemini` | The only provider this build implements. Any other value is refused with a message naming the supported one — a 503, never a 500. |
+| `LLM_API_KEY` | *(empty)* | The Gemini API key for `generativelanguage.googleapis.com`. **`.env` only.** |
+| `LLM_MODEL` | `gemini-2.5-flash` | Overridable by env var. Deliberately not in `.env.example`, so a stale `.env` needs no edit. |
+
+**No API key is committed.** `.env` is gitignored and has never been tracked; `.env.example`
+carries no key. The key is read in exactly one place — `app.config.settings.llm_api_key`, used only
+by `app/llm/client.py` — and is sent as the `x-goog-api-key` **header**, never in a URL or a query
+string, so it cannot end up in a log line or a proxy's access log. The client also scrubs the key
+out of any provider text before logging it, in case a provider ever echoes it back in an error.
+
+`gemini-2.5-flash` is a pinned name rather than an alias such as `gemini-flash-latest`, so the demo
+cannot shift underneath us. If the configured model is not on the key's account, the client asks the
+API which models it does offer and says so by name.
+
+### The three endpoints, and the CLI
+
+```bash
+# 1. A driver's sentence -> the two form values, or null when it stated nothing readable
+curl -s localhost:8000/api/llm/extract -d '{"text":"I need 80% by 7am tomorrow"}'
+# {"target_soc":0.8,"deadline_iso":"2026-09-13T07:00:00+05:30","confidence":"high",
+#  "detected_language":"English"}
+
+# 2. One session's plan in 2-3 sentences. `language` is optional: "English" | "Hindi" | "Gujarati"
+curl -s localhost:8000/api/llm/explain -d '{"session_id":1,"language":"Hindi"}'
+# {"text":"...","llm_used":true}
+
+# 3. An operator question, answered from the three tools only
+curl -s localhost:8000/api/llm/copilot -d '{"question":"Which cars will miss their deadline?"}'
+# {"answer":"...","tools_used":["query_sessions"]}
+```
+
+Shapes and limits, from `backend/app/routers/llm.py`: `/extract` takes `text` up to 2000
+characters (422 above that, and 413 without reading the body when the declared length exceeds
+16 KiB) and answers **200 with `null`** — not a 404 or a 422 — when the sentence stated nothing
+readable, because a failed extraction is an ordinary outcome the driver's form absorbs. `/explain`
+takes `session_id` and an optional `language` (≤ 40 characters), and answers 404 for an unknown
+session and 503 when no carbon forecast is cached for the site's zone — the same rule as
+`GET /api/sessions/{id}/impact`. `/copilot` takes a `question` of 1–500 characters and returns the
+tool names that actually ran.
+
+`llm_used` on `/explain` is provenance, and it is reported by the code that picked the sentences
+rather than guessed afterwards from the string: `true` means the model wrote them, `false` means the
+deterministic explanation did. Both are equally true — they quote the same computed numbers — but an
+operator (and a judge) is entitled to know which one they are reading.
+
+The spec's acceptance test is the extraction CLI, run from `backend/`:
+
+```bash
+python -m app.llm.extract --test "मुझे कल सुबह 7 बजे तक 80% चाहिए"
+python -m app.llm.extract --test "leaving at 4am, need full charge"
+python -m app.llm.extract --test "asdfgh"     # prints None, exit 0
+```
+
+Run on 2026-09-12 they print, in order:
+
+```
+{ "target_soc": 0.8, "deadline_iso": "2026-09-13T07:00:00+05:30", "confidence": "high", "detected_language": "Hindi" }
+{ "target_soc": 1.0, "deadline_iso": "2026-09-13T04:00:00+05:30", "confidence": "high", "detected_language": "English" }
+None
+```
+
+The third is the point: gibberish states no constraints, so nothing is extracted and nothing is
+invented to fill the gap — and the exit code is 0 either way, so the acceptance test can never fail
+on a traceback. With no key configured all three print `None` as well: the CLI calls
+`extract_constraints` directly, which skips the call it knows will fail. Over HTTP the endpoint
+answers 503 instead, and the driver's form treats the two the same way. Relative times resolve
+against the **simulated** clock; `--now <ISO>` overrides it.
+
+### Languages
+
+English, Hindi and Gujarati, in all three capabilities. Hinglish written in Latin script ("bhai
+subah 6 baje tak 90 percent kar do") is read as well. `/explain` validates the script of the reply,
+not just the label, so a Hindi request that comes back in English is rejected. The `language` field
+is mapped through a fixed table (`en`/`hi`/`gu`, the native names; anything unrecognised becomes
+English), so a client string is never a free-text channel into the prompt. The deterministic
+fallback exists in all three languages too.
+
+### The copilot's three tools
+
+Exactly three, by design — the spec allows no others, and `TOOLS` is the whitelist checked again at
+dispatch:
+
+| Tool | Arguments | What it returns |
+|---|---|---|
+| `query_sessions` | `status` (`active`/`completed`/`aborted`/`any`), `site_id`, `hours` 1–720, `limit` 1–20 (default 5) | `matching_sessions` — the count matching the filters — and up to `limit` rows: vehicle, charger, status, SoC, energy delivered, that session's own savings, its deadline and whether it is on time |
+| `get_site_performance` | `site_id` (required), `days` 1–90 (default 7) | one site's totals over whole past days: sessions, sessions on time, energy, CO₂ and rupees saved, peak load, and the `basis` they are measured on |
+| `get_carbon_history` | `hours` 1–168 (default 24) | the grid curve already summarised: latest, minimum, maximum, mean, and the greenest and dirtiest times |
+
+Two model round trips per question — one to choose the tools, one to narrate their results — and at
+most `MAX_CALLS = 2` tool calls in between. A question none of the three fits is answered with our
+own fixed sentence, so even a refusal cannot carry a number. There is **no copilot UI**: Phase 7
+adds no screen, the operator dashboard does not call it, and it is demonstrated with the `curl`
+above.
+
+### Nothing waits on it, and nothing breaks without it
+
+`client.complete()` returns `None` on every failure there is — no key, an unsupported provider, a
+timeout, a connection refused, a 4xx or 5xx, a non-JSON body, a safety block, a truncated reply —
+and never raises. Above it:
+
+- **No key configured:** all three endpoints answer **503** in about a millisecond with the reason
+  (which setting is missing, and that every other GreenCharge feature works without it). Never a
+  500, never a hang.
+- **`/extract` fails:** **200 `null`**, and the driver fills the form in by hand. Both attempts
+  share a 15 s budget.
+- **`/explain` fails:** **200** with the deterministic sentences and `llm_used: false`. A driver
+  never waits on a failure: the whole call, retry included, is capped at 8 s, and the fallback text
+  is built before the first request goes out.
+- **`/copilot` fails:** **503** — it is the one capability with nothing to show without a model.
+  Per call 20 s, and the whole question is capped at `TOTAL_BUDGET_S = 45 s`, so a pathological
+  request can never leave a demo screen spinning indefinitely. Observed live: 1.3–16.6 s.
+- **With the network off** the calls fail on DNS in hundredths of a second, and the rest of the
+  product is untouched: the optimizer, the OCPP round trip, the dashboard, the driver app and every
+  other endpoint carry on exactly as they do with `GRID_PROVIDER=synthetic`.
+
+Under those budgets sits the transport's own: `DEFAULT_TIMEOUT_S = 12 s` per request with
+`CONNECT_TIMEOUT_S = 5 s` to connect (`client.py`), which `extract` and `explain` override with
+whatever is left of their 15 s and 8 s. Each is a deadline over the whole call, not a per-read
+timeout, so a provider dribbling bytes cannot keep resetting the clock past it. In the browser both
+calls carry `LLM_REQUEST_TIMEOUT_MS` = 15 s (`frontend/src/api/client.ts`) — exactly the extraction
+budget, so either side may be the one that gives up, and both outcomes leave the same untouched form.
+
+The layer is isolated structurally as well as by configuration: **no module outside
+`backend/app/llm/` imports `app.llm` except its own router**. The optimizer, the orchestrator, the
+OCPP layer, the accounting and the scenarios cannot reach it, and deleting the key changes nothing
+but the three endpoints.
 
 ## Decisions & deviations
 
@@ -727,6 +950,38 @@ Phase 6 (driver app):
   409 for a busy charger — the form looks for an active session on the same charger, with the same
   car and the same starting charge, and adopts it instead of stranding the driver.
 
+Phase 7 (LLM layer):
+
+- **The spec's Phase 7 manifest is backend-only**, and the five `backend/app/llm/` modules plus the
+  approved `backend/app/routers/llm.py` are all of it. The driver app also gained a "say it in your
+  own words" box and a narrated plan, which touched `frontend/src/pages/DriverApp.tsx` and
+  `frontend/src/api/client.ts` — two existing Phase 6 files, no new file and no new package. Both
+  uses are assistive: extraction prefills the form the driver still submits, and the narration
+  replaces sentences, never the numbers on the tiles.
+- **The copilot's savings and the dashboard's headline are measured on different bases**, and they
+  differ while a car is still charging — both are our own numbers, but they answer different
+  questions. The copilot's tools report each session's **whole naive-charging baseline** minus what
+  its meters have actually reported, so a session mid-charge contributes a baseline for charging it
+  has not done yet; `GET /api/impact/summary`, which the dashboard renders, also nets off the
+  charging still *planned* in the remaining slots. Measured live on one session: 13.1 kg from the
+  copilot against 2.9 kg on the dashboard. Each tool result carries a `basis` field saying exactly
+  what its figure measures, and the answer prompt requires the copilot to qualify any saving it
+  quotes the way that basis describes it, so the two can be reconciled on screen. Reconciling the
+  *numbers* is a product decision and has not been taken: `get_site_performance` deliberately does
+  not depend on a cached forecast, which is what netting off the remaining plan would require.
+- **`LLM_MODEL` is not in `.env.example`.** It defaults in `config.py`, so an existing `.env` needs
+  no edit; set it only to pin a different model.
+- **The phone view always narrates in English, and ignores `llm_used`.** `/api/llm/explain` accepts
+  `language`, and both the model path and the deterministic fallback are written in all three
+  languages, but `postLlmExplain` does not send the field yet. Extraction already reads all three
+  and names the one it read in the "Understood" banner.
+- **The copilot ships without a screen.** It is complete and exercised by hand over HTTP; Phase 7
+  deliberately adds no UI, so a judge sees it through `curl` rather than on the dashboard.
+- **The number-grounding check is deliberately strict**, so an answer that reaches for a figure we
+  did not supply is replaced by the deterministic text (on `/explain`) or refused with a 503 (on
+  `/copilot`) rather than shown. That is the rule working, and it occasionally costs a livelier
+  sentence.
+
 ## Phase status
 
 - Phase 0 — Scaffold: acceptance passed (`/health` reports db and redis true; page reads "GreenCharge")
@@ -744,3 +999,8 @@ Phase 6 (driver app):
   charge, then override — a car the optimizer had paused at 0 kW was commanded to its full 11 kW
   within one tick, with the other five cars left paused and the site limit still respected). See
   [Driver app](#driver-app-phase-6).
+- Phase 7 — LLM layer: built and reviewed; the acceptance result is the orchestrator's to record.
+  The spec's three `python -m app.llm.extract --test` commands were run live against
+  `gemini-2.5-flash` and returned `0.8 / 2026-09-13T07:00:00+05:30 / high / Hindi`,
+  `1.0 / 2026-09-13T04:00:00+05:30 / high / English` and `None` (exit 0, no traceback), and all
+  three endpoints answered on a live stack. See [LLM layer](#llm-layer-phase-7).

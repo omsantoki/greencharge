@@ -11,6 +11,10 @@ Behaviour:
   StatusNotification(Charging) runs in a separate task that starts after the reply has been sent.
   DEADLOCK RULE: an @on handler runs inline on the receive loop, so it never awaits an outbound
   call; follow-up calls always run in their own task.
+* Fault injection (the demo's "fault_injection" scenario): the CSMS relays a fault as
+  DataTransfer(vendorId "GreenCharge", messageId "SimFault"). The handler replies Accepted, and a
+  task started after the reply drops the connector's limit to 0 kW and reports
+  StatusNotification(Faulted). The transaction stays open, drawing nothing, until the car leaves.
 * Charging: the battery advances every 1 real second with the spec's ``step()``; the power drawn is
   ``min(limit_kw, acceptance_kw(soc, max_kw))``. The limit is the charger rating until a
   SetChargingProfile (TxProfile, unit W) replaces it with its period-0 limit. The energy register
@@ -78,6 +82,8 @@ RETRY_DELAY_S = 2.0  # reconnect delay while the CSMS is down; also the BootNoti
 CONNECTOR_ID = 1  # one connector per CP (the spec's SetChargingProfile payload targets connector 1)
 VENDOR_ID = "GreenCharge"  # DataTransfer vendorId of the plug-in relay
 PLUG_IN_MESSAGE_ID = "SimPlugIn"  # DataTransfer messageId of the plug-in relay
+FAULT_MESSAGE_ID = "SimFault"  # DataTransfer messageId of the fault-injection relay
+FAULT_ERROR_CODE = ChargePointErrorCode.ground_failure  # error code reported with Faulted
 CHARGE_POINT_VENDOR = "GreenCharge"  # BootNotification chargePointVendor (max 20 chars)
 CHARGE_POINT_MODEL = "SimChargePoint"  # BootNotification chargePointModel (max 20 chars)
 ID_TAG_MAX_LEN = 20  # OCPP 1.6 idTag is at most 20 characters
@@ -314,6 +320,7 @@ class SimChargePoint(ChargePoint):
         self.id_tag = f"SIM-{ocpp_id}"[:ID_TAG_MAX_LEN]
         self._ready = False  # True once Boot is accepted and the connector status is reported
         self._accepted_plug_in: PlugIn | None = None  # handed from on_ to after_data_transfer
+        self._accepted_fault = False  # likewise, for an accepted fault injection
         self._tasks: set[asyncio.Task] = set()
 
     # ------------------------------------------------------------------ connection lifecycle
@@ -403,12 +410,15 @@ class SimChargePoint(ChargePoint):
             log.warning("%s: the CSMS answered %s with a CallError", self.id, name)
         return result
 
-    async def _status(self, status: ChargePointStatus) -> None:
-        log.info("%s: StatusNotification %s", self.id, status)
+    async def _status(
+        self, status: ChargePointStatus, error_code: str = ChargePointErrorCode.no_error
+    ) -> None:
+        reported = "" if error_code == ChargePointErrorCode.no_error else f" ({error_code})"
+        log.info("%s: StatusNotification %s%s", self.id, status, reported)
         await self._call(
             call.StatusNotification(
                 connector_id=CONNECTOR_ID,
-                error_code=ChargePointErrorCode.no_error,
+                error_code=error_code,
                 status=status,
                 timestamp=self.clock.iso_now(),
             )
@@ -458,12 +468,15 @@ class SimChargePoint(ChargePoint):
     def on_data_transfer(
         self, vendor_id: str, message_id: str | None = None, data: str | None = None, **kwargs: Any
     ) -> call_result.DataTransfer:
-        """Plug-in relay from the CSMS: validate and reply only.
+        """Plug-in and fault-injection relay from the CSMS: validate and reply only.
 
-        The plug-in sequence is started by ``after_data_transfer`` once this reply has been sent.
+        The sequence the accepted message starts is spawned by ``after_data_transfer`` once this
+        reply has been sent.
         """
         if vendor_id != VENDOR_ID:
             return call_result.DataTransfer(status=DataTransferStatus.unknown_vendor_id)
+        if message_id == FAULT_MESSAGE_ID:
+            return self._accept_fault()
         if message_id != PLUG_IN_MESSAGE_ID:
             return call_result.DataTransfer(status=DataTransferStatus.unknown_message_id)
         if not self._ready or self.state.phase != IDLE:
@@ -479,12 +492,25 @@ class SimChargePoint(ChargePoint):
         self._accepted_plug_in = plug_in
         return call_result.DataTransfer(status=DataTransferStatus.accepted)
 
+    def _accept_fault(self) -> call_result.DataTransfer:
+        """Accept a fault injection unless this CP has not finished booting."""
+        if not self._ready:
+            log.warning("%s: fault injection rejected: boot not complete", self.id)
+            return call_result.DataTransfer(
+                status=DataTransferStatus.rejected, data="boot not complete"
+            )
+        self._accepted_fault = True
+        return call_result.DataTransfer(status=DataTransferStatus.accepted)
+
     @after(Action.data_transfer)
     def after_data_transfer(self, **kwargs: Any) -> None:
-        """Runs after the DataTransfer reply was sent: start the accepted plug-in sequence."""
+        """Runs after the DataTransfer reply was sent: start the sequence it accepted."""
         plug_in, self._accepted_plug_in = self._accepted_plug_in, None
         if plug_in is not None:
             self._spawn(self._plug_in_sequence(plug_in), "plug-in")
+        if self._accepted_fault:
+            self._accepted_fault = False
+            self._spawn(self._fault_sequence(), "fault")
 
     @on(Action.set_charging_profile)
     def on_set_charging_profile(
@@ -599,6 +625,29 @@ class SimChargePoint(ChargePoint):
         )
         await self._status(ChargePointStatus.charging)
         self._spawn(self._run_transaction(), "transaction")
+
+    async def _fault_sequence(self) -> None:
+        """Drop the connector's limit to 0 kW, then StatusNotification(Faulted).
+
+        A running transaction is kept open and keeps reporting MeterValues, now at 0 kW: the car
+        is still plugged in, the charge point simply cannot charge it. The CSMS stores the status
+        and its orchestrator plans nothing for a faulted charger, which is what the fault-injection
+        scenario shows. Nothing here clears the fault; the next transaction end does, with the
+        usual Finishing -> Available.
+        """
+        tx = self.state.tx
+        if tx is None:
+            log.warning("%s: fault injected with no transaction running", self.id)
+        else:
+            self._advance(tx)  # integrate up to now at the old limit
+            tx.limit_kw = 0.0
+            if tx.stop_reason is None:
+                tx.power_kw = self._power_now(tx)
+            log.warning(
+                "%s: fault injected on transaction %d -> drawing %.2f kW",
+                self.id, tx.transaction_id, tx.power_kw,
+            )
+        await self._status(ChargePointStatus.faulted, FAULT_ERROR_CODE)
 
     async def _run_transaction(self) -> None:
         """Physics every PHYSICS_INTERVAL_S and MeterValues every METER_INTERVAL_S (real seconds)

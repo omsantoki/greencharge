@@ -1,7 +1,7 @@
 """LLM endpoints (Phase 7). Three narrow capabilities, never a general chatbot.
 
     POST /api/llm/extract  {"text": "..."}                 -> ExtractedConstraints or null
-    POST /api/llm/explain  {"session_id": 1, "language"?}  -> {"text": "..."}
+    POST /api/llm/explain  {"session_id": 1, "language"?}  -> {"text", "llm_used"}
     POST /api/llm/copilot  {"question": "..."}             -> {"answer", "tools_used"}
 
 Bodies are read with ``parse_json_body``, so they work without a Content-Type header, exactly
@@ -24,7 +24,8 @@ Nothing blocks on the LLM:
 - ``/extract`` answers 200 with ``null`` when the model fails or the message states nothing; the
   driver UI falls back to the manual form.
 - ``/explain`` always answers 200 with text: ``explain_schedule`` falls back to deterministic
-  sentences built from these same gathered values when the model fails.
+  sentences built from these same gathered values when the model fails. ``llm_used`` says which
+  of the two wrote them, reported by the code that chose rather than guessed from the string.
 - ``/copilot`` is the one endpoint with nothing to show without the model: it answers 503 when
   the model or its tools cannot produce a grounded answer.
 
@@ -88,7 +89,15 @@ class ExplainRequest(BaseModel):
 
 
 class ExplainOut(BaseModel):
+    """The sentences, and whether the model or our own deterministic text wrote them.
+
+    ``llm_used`` is reported by ``explain.explain_schedule`` at the point it picks an answer, not
+    inferred here from the string: the two paths produce prose that looks alike (they quote the
+    same computed numbers), so only the code that chose can say truthfully which one ran.
+    """
+
     text: str
+    llm_used: bool
 
 
 class CopilotRequest(BaseModel):
@@ -195,11 +204,12 @@ def _explain_inputs(session_id: int, now: datetime) -> dict[str, Any] | None:
 
 
 @router.post("/explain", response_model=ExplainOut)
-async def llm_explain(request: Request) -> dict[str, str]:
+async def llm_explain(request: Request) -> dict[str, Any]:
     """Explain one session's schedule in 2-3 sentences, from values computed here.
 
-    ``explain_schedule`` always returns text -- it builds deterministic sentences from the same
+    ``explain_schedule`` always returns sentences -- it builds deterministic ones from the same
     values when the model is slow, unreachable or wrong -- so a driver never waits on a failure.
+    The response says which of the two wrote them (``llm_used``).
     That guarantee is the whole endpoint: the driver's plan screen renders this text, so anything
     that goes wrong BELOW the model (``accounting`` raising, a plan without its ``slots``, a
     database that has gone away) answers with the deterministic sentences too, never a 500.
@@ -222,11 +232,13 @@ async def llm_explain(request: Request) -> dict[str, str]:
         raise HTTPException(status_code=404, detail=f"Session {body.session_id} not found")
 
     try:
-        text = await explain.explain_schedule(**facts, language=language)
+        result = await explain.explain_schedule(**facts, language=language)
     except Exception:  # explain.py owns this guarantee; this is the belt to its braces
         logger.exception("Explaining session %d failed", body.session_id)
-        text = explain.fallback_text(explain.ExplainFacts(), language)
-    return {"text": text}
+        result = explain.Explanation(
+            explain.fallback_text(explain.ExplainFacts(), language), llm_used=False
+        )
+    return {"text": result.text, "llm_used": result.llm_used}
 
 
 # --------------------------------------------------------------------------------------------

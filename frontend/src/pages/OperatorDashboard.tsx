@@ -33,6 +33,7 @@ import { useLiveData } from '../hooks/useLiveData';
 
 import CarbonGauge from '../components/CarbonGauge';
 import ChargerGrid from '../components/ChargerGrid';
+import DemoControls from '../components/DemoControls';
 import ImpactScorecard from '../components/ImpactScorecard';
 import LoadCurve from '../components/LoadCurve';
 import OcppLog from '../components/OcppLog';
@@ -46,7 +47,6 @@ const SLOW_POLL_MS = 15000; // the 24 h carbon forecast only advances one 15-min
 const FORECAST_HOURS = 24;
 const OCPP_LOG_LIMIT = 50;
 const SITE_TZ = 'Asia/Kolkata';
-const SCENARIO_COMMAND = '.venv/bin/python scripts/demo_scenario.py --scenario evening_rush';
 
 /* ------------------------------------------------------------------ formatting */
 
@@ -344,22 +344,13 @@ export default function OperatorDashboard() {
           </Slot>
         </div>
 
-        {idle ? (
-          <section className="rounded-xl border border-amber-400 bg-amber-50 px-5 py-4">
-            <h2 className="text-base font-bold text-amber-900">No cars are charging right now</h2>
-            <p className="mt-1 max-w-4xl text-sm text-amber-900">
-              The site is idle, so the plan below has no rows yet. Start the headline scenario from
-              the project root — six cars plug in between 18:30 and 19:15 and all leave at 07:00:
-            </p>
-            <code className="mt-2 block w-fit max-w-full overflow-x-auto rounded-md border border-amber-400 bg-white px-3 py-1.5 font-mono text-[13px] text-slate-800">
-              {SCENARIO_COMMAND}
-            </code>
-            <p className="mt-2 text-xs text-amber-800">
-              The carbon background below stays live either way: it is the next 24 hours of grid
-              carbon intensity. One-click scenario buttons arrive in a later phase.
-            </p>
-          </section>
-        ) : null}
+        {/*
+          Phase 8: the scenarios are one click each. The panel is always present — the judge never
+          touches a terminal — and it owns its own poll of GET /api/demo/status.
+        */}
+        <PanelBoundary name="DemoControls">
+          <DemoControls idle={idle} onChanged={refreshAfterReplan} disabled={everythingDown} />
+        </PanelBoundary>
 
         {/*
           The plan is the hero. Its SVG is a fixed aspect ratio, so its height follows the number of

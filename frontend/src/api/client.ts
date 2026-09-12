@@ -25,6 +25,15 @@ export const REQUEST_TIMEOUT_MS = 10_000;
  */
 export const LLM_REQUEST_TIMEOUT_MS = 15_000;
 
+/**
+ * The budget for POST /api/demo/reset. Its own server-side work is bounded but slower than a
+ * read: up to 3 s waiting for the StopTransactions, up to 3 s for an orchestrator tick still in
+ * flight, then a TRUNCATE that retries a lock timeout twice. Ten seconds would abort a reset that
+ * was still going to succeed, and on stage a reset that reports failure while working is worse
+ * than one that takes a moment.
+ */
+export const DEMO_RESET_TIMEOUT_MS = 20_000;
+
 /** `ApiError.status` when the request never produced an HTTP response (offline, DNS, timeout). */
 export const NETWORK_ERROR_STATUS = 0;
 
@@ -240,6 +249,84 @@ export type ExtractedConstraints = {
  */
 export type ExplainText = {
   text: string;
+};
+
+/**
+ * One car in a demo scenario, as GET /api/demo/status reports it. `status` is "pending" before
+ * the scenario reaches it, "plugged_in" once its session exists, "failed" when the plug-in was
+ * refused, "skipped" when the run stopped before it.
+ */
+export type DemoEvent = {
+  step: number;
+  offset_min: number;
+  scheduled_at: string;
+  local_time: string;
+  charger_id: number;
+  vehicle_model: string;
+  soc_start: number;
+  soc_target: number;
+  status: string;
+  requested_at: string | null;
+  hours_until_departure: number | null;
+  session_id: number | null;
+  transaction_id: number | null;
+  ocpp_id: string | null;
+  detail: string | null;
+};
+
+/**
+ * The fault "fault_injection" injects, as GET /api/demo/status reports it. It is not a step of
+ * its own: `status` is "pending" until it fires, then "faulted" (the charge point reported
+ * Faulted) or "failed". Null for the three scenarios that inject nothing.
+ */
+export type DemoFault = {
+  offset_min: number;
+  scheduled_at: string;
+  local_time: string;
+  charger_id: number;
+  status: string;
+  requested_at: string | null;
+  ocpp_id: string | null;
+  charger_status: string | null;
+  detail: string | null;
+};
+
+/**
+ * GET /api/demo/status — the latest scenario run, running or finished. Every field is null/0/[]
+ * when none has been started since the backend came up. `step` counts the plug-ins done.
+ */
+export type DemoStatus = {
+  scenario: string | null;
+  running: boolean;
+  step: number;
+  total_steps: number;
+  events: DemoEvent[];
+  fault: DemoFault | null;
+  error: string | null;
+};
+
+/** POST /api/demo/scenario/{name} — the run has been started in the background, not finished. */
+export type DemoScenarioStarted = {
+  scenario: string;
+  started: boolean;
+  steps: number;
+};
+
+/** One session the reset stopped. `stopped` is false when its StopTransaction never arrived. */
+export type DemoResetSession = {
+  session_id: number;
+  ocpp_id: string;
+  remote_stop: string;
+  stopped: boolean;
+};
+
+/** POST /api/demo/reset — sessions, meter values and schedules are gone; seed data survives. */
+export type DemoResetResult = {
+  reset: boolean;
+  sessions: DemoResetSession[];
+  waited_s: number;
+  truncated: boolean;
+  cancelled_scenario: string | null;
 };
 
 /* ------------------------------------------------------------------ errors */
@@ -514,6 +601,37 @@ export function postLlmExplain(sessionId: number, signal?: AbortSignal): Promise
   );
 }
 
+/**
+ * The latest demo run, running or finished. A cheap in-memory read on the backend: it touches
+ * neither the database nor the charge points, so the demo panel may poll it while a run is live.
+ */
+export function getDemoStatus(signal?: AbortSignal): Promise<DemoStatus> {
+  return getJson<DemoStatus>('/api/demo/status', signal);
+}
+
+/**
+ * Start a demo scenario. Resolves as soon as the run has been accepted — the cars plug in over
+ * the following simulated minutes, so the caller watches {@link getDemoStatus} for progress.
+ * Throws ApiError(404) for an unknown name and ApiError(409) when a scenario is already running
+ * or a reset is in progress; neither is a failure worth alarming the operator with.
+ */
+export function postDemoScenario(name: string, signal?: AbortSignal): Promise<DemoScenarioStarted> {
+  return postJson<DemoScenarioStarted>(
+    `/api/demo/scenario/${encodeURIComponent(name)}`,
+    {},
+    signal,
+  );
+}
+
+/**
+ * Clear all demo state: cancel a running scenario, RemoteStop every active session, then truncate
+ * sessions, schedules and meter values. Seed data and the carbon cache survive. Throws
+ * ApiError(503) when the database refused the work.
+ */
+export function postDemoReset(signal?: AbortSignal): Promise<DemoResetResult> {
+  return postJson<DemoResetResult>('/api/demo/reset', {}, signal, DEMO_RESET_TIMEOUT_MS);
+}
+
 /** Alias of {@link postWeights}. */
 export const setWeights = postWeights;
 /** Alias of {@link postOverride}. */
@@ -538,6 +656,9 @@ export const api = {
   postPlugIn,
   postLlmExtract,
   postLlmExplain,
+  getDemoStatus,
+  postDemoScenario,
+  postDemoReset,
 };
 
 export default api;

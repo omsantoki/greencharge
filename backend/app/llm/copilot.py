@@ -284,8 +284,12 @@ def _query_sessions_blocking(
         "now_local": _local(now),
         "sessions": sessions,
         "basis": (
-            "co2_saved / cost_saved are baseline minus actual on the energy the meters have "
-            "already reported; charging still planned is not included."
+            "co2_saved / cost_saved are the session's whole naive-charging baseline minus what "
+            "the meters have actually reported so far. For a session still charging that is not "
+            "its final saving: the baseline covers charging the car has not done yet, so qualify "
+            "the figure as measured against the whole session's naive-charging baseline. The "
+            "operator dashboard's headline nets off the charging still planned, so it is smaller "
+            "while a car is mid-session."
         ),
     }
 
@@ -391,8 +395,12 @@ def _site_performance_blocking(
         "chargers": chargers,
         **peaks,
         "basis": (
-            "Savings are baseline minus actual on metered energy over the window; aborted "
-            "sessions are excluded. The peaks are the current 96-slot load curve."
+            "Savings are each session's whole naive-charging baseline minus what its meters have "
+            "actually reported; aborted sessions are excluded. A session still charging therefore "
+            "contributes the baseline of its WHOLE session, including charging it has not done "
+            "yet, so this is not a final figure and it is larger than the operator dashboard's "
+            "headline while a car is mid-session. Qualify it as measured against the whole "
+            "session's naive-charging baseline. The peaks are the current 96-slot load curve."
         ),
     }
 
@@ -439,13 +447,11 @@ async def get_carbon_history(hours: int = 24) -> dict[str, Any]:
     values = [float(p.carbon_intensity) for p in points]
     greenest = min(points, key=lambda p: p.carbon_intensity)
     dirtiest = max(points, key=lambda p: p.carbon_intensity)
-    # At most 24 samples of the curve, evenly spaced, so the shape is visible without handing
-    # over hundreds of points (and without the model ever having to aggregate them itself).
-    step = max(1, len(points) // 24)
-    series = [
-        {"time_local": _local(p.ts), "gco2_per_kwh": _r(p.carbon_intensity, 1)}
-        for p in points[::step]
-    ][:24]
+    # The curve ITSELF is deliberately not returned. BUILD_SPEC Phase 7 DO NOT: "Let the LLM see
+    # raw grid data and compute savings itself." Handing over even a thinned sample of the points
+    # would invite exactly that, and it would widen the pool of numbers the grounding check below
+    # accepts -- a mean or a trend the model worked out could then ground by coinciding with one
+    # sample. The summary below is computed here, in our code, and it is all the model sees.
     return {
         "zone": zone,
         "source": provider.source,
@@ -460,7 +466,6 @@ async def get_carbon_history(hours: int = 24) -> dict[str, Any]:
         "mean_gco2_per_kwh": _r(sum(values) / len(values), 1),
         "greenest_time_local": _local(greenest.ts),
         "dirtiest_time_local": _local(dirtiest.ts),
-        "samples": series,
         **(
             {}
             if requested_hours <= hours
@@ -541,7 +546,11 @@ Rules, in order of importance:
 4. If the tool results do not answer the question exactly, say plainly what is missing AND give
    the closest figures they do contain, naming the window those figures cover. Never stop at
    "the tool results do not provide that" when a summary of the same quantity is in front of you.
-5. Answer in at most three sentences, in the operator's language, plain and factual.
+5. A tool result's "basis" field says what its figures actually measure, and it is not optional
+   background: when you quote a saving from a result whose basis qualifies it, qualify it the same
+   way, in the same sentence or the next one. An operator comparing your answer with the dashboard
+   must be able to see why the two differ.
+6. Answer in at most three sentences, in the operator's language, plain and factual.
 
 Reply with JSON only, no prose and no code fences: {"answer": "<your answer>"}
 """
@@ -769,12 +778,15 @@ async def _run_call(call: Any) -> dict[str, Any]:
         return await get_carbon_history(call.arguments.hours)
     except ToolError as exc:
         return {"error": str(exc)}
-    except Exception as exc:  # database, provider or programming error in this one tool
+    except Exception:  # database, provider or programming error in this one tool
         logger.exception("Copilot tool %s failed", call.tool)
-        # One short line for the model: a driver's traceback-length message (SQL and all) would
-        # drown the other tool's numbers in the payload. The full detail is in the log above.
-        detail = " ".join(str(exc).split())[:160] or type(exc).__name__
-        return {"error": f"{call.tool} could not be run: {detail}"}
+        # One fixed line, and deliberately not ``str(exc)``. This string is shown to the model and,
+        # when every tool failed, it is also the 503 body an operator reads -- and the message of
+        # an unexpected exception here is written by a library, not by us: a dropped connection
+        # carries the database host and port, a missing file its absolute path. The cause is in
+        # the log above, where it belongs, and no key can reach either place (the API key never
+        # leaves ``client.py``, whose failures are already None rather than exceptions).
+        return {"error": f"{call.tool} could not be run (the cause is in the server log)."}
 
 
 async def _narrate(question: str, payload: str) -> str:

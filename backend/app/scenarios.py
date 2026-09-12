@@ -11,13 +11,23 @@ A scenario is a deterministic script of plug-ins. ``run_scenario(name)``:
    ``offset_min * 60 / TIME_SCALE`` real seconds, measured from the moment the clock was set),
    through ``app.routers.debug.perform_plug_in`` -- the same OCPP round trip as
    POST /api/debug/plug-in -- with ``hours_until_departure`` = the next ``depart_local`` after
-   the plug-in time minus the plug-in time.
+   the plug-in time;
+4. runs the scenario's ``fault``, when it has one (only "fault_injection" has): at
+   ``fault.offset_min`` SIMULATED minutes after the clock was set -- always after the last
+   plug-in -- it sends that charger's charge point a DataTransfer (vendor "GreenCharge", message
+   "SimFault"). The simulated charge point drops its power to 0 kW and reports
+   StatusNotification(Faulted); the CSMS stores that status and asks the orchestrator for a
+   re-plan, and a faulted charger is unavailable in every slot, so its session gets an all-zero
+   plan and the others are re-optimised with the headroom it leaves. The step waits for the
+   Faulted status to arrive, so the scenario is only done once the fault is real.
 
 Progress is kept in memory for GET /api/demo/status (``scenario_status()``). A plug-in that the
 charge point refuses with 409 is retried for a few real seconds (a charge point that has just
 been stopped by the reset accepts a new car only once it is back to Available); any other
-failure, or a 409 that persists, stops the scenario with ``error`` set. Phase 4 defines only
-"evening_rush"; Phase 8 adds the other scenarios.
+failure, or a 409 that persists, stops the scenario with ``error`` set; so does a fault that
+could not be delivered (the scenario IS the fault). The fault has its own entry in the status
+(``"fault"``), not a step of its own. Phase 4 defines "evening_rush"; Phase 8 adds
+"workplace_solar", "tight_deadline" and "fault_injection".
 
 Demo reset (POST /api/demo/reset, and step 1 of every scenario), ``perform_reset()``:
 
@@ -47,7 +57,8 @@ from http import HTTPStatus
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from ocpp.v16.enums import ChargePointStatus, RemoteStartStopStatus
+from ocpp.v16 import call
+from ocpp.v16.enums import ChargePointStatus, DataTransferStatus, RemoteStartStopStatus
 from sqlalchemy import select, text
 from sqlalchemy.exc import OperationalError, SQLAlchemyError
 
@@ -56,7 +67,7 @@ from app.config import settings
 from app.db import SessionLocal, engine
 from app.models import Charger, MeterValue, Schedule, Session
 from app.ocpp import registry
-from app.ocpp.handlers import STATUS_TIMEOUT
+from app.ocpp.handlers import PLUG_IN_VENDOR_ID, STATUS_CALL_ERROR, STATUS_TIMEOUT
 from app.orchestrator import loop as orchestrator
 from app.routers.debug import PlugInError, perform_plug_in
 from app.schemas import PlugInRequest
@@ -80,12 +91,24 @@ class PlugInEvent:
 
 
 @dataclass(frozen=True)
+class FaultEvent:
+    """One charger going Faulted, ``offset_min`` simulated minutes after the scenario start.
+
+    Keep the offset after the last plug-in: the step runs once every car is in.
+    """
+
+    offset_min: int
+    charger_id: int
+
+
+@dataclass(frozen=True)
 class Scenario:
     name: str
     description: str
     start_local: str  # "HH:MM", site-local time the simulation clock is set to
     depart_local: str  # "HH:MM", site-local time every car leaves (the next one after plug-in)
     events: tuple[PlugInEvent, ...]
+    fault: FaultEvent | None = None  # the fault injected after the plug-ins, if any
 
 
 SCENARIOS: dict[str, Scenario] = {
@@ -104,6 +127,56 @@ SCENARIOS: dict[str, Scenario] = {
             PlugInEvent(36, 5, "BYD Atto 3", 0.40, 0.80),
             PlugInEvent(45, 6, "Hyundai Kona", 0.30, 0.80),
         ),
+    ),
+    "workplace_solar": Scenario(
+        name="workplace_solar",
+        description="6 cars plug in 09:00-09:30, leave 18:00. Shows the midday solar capture.",
+        start_local="09:00",
+        depart_local="18:00",
+        # Office hours: nine hours of slack for about 73 kWh (grid side), which the site's 40 kW
+        # could deliver in under two. The cheapest four hours of the day by carbon intensity are
+        # 11:00-15:00 (520 gCO2/kWh against 620 before and 650 after, and the solar tariff block
+        # 09:00-17:00 is flat), so the whole fleet is planned into that trough -- the midday
+        # cluster on the Gantt is the point of this scenario. Every car keeps room to move: none
+        # needs more than about two hours at its own AC limit.
+        events=(
+            PlugInEvent(0, 1, "Tata Nexon EV", 0.45, 0.70),
+            PlugInEvent(6, 2, "Tata Tiago EV", 0.40, 0.75),
+            PlugInEvent(12, 3, "MG ZS EV", 0.50, 0.75),
+            PlugInEvent(18, 4, "Mahindra XUV400", 0.45, 0.75),
+            PlugInEvent(24, 5, "BYD Atto 3", 0.50, 0.70),
+            PlugInEvent(30, 6, "Hyundai Kona", 0.40, 0.70),
+        ),
+    ),
+    "tight_deadline": Scenario(
+        name="tight_deadline",
+        description="1 car needs 45 kWh in 3 hours. Demonstrates the relaxed/infeasible path.",
+        start_local="19:00",
+        depart_local="22:00",
+        # 0.75 x 60.5 kWh = 45.4 kWh wanted; the BYD accepts 7.0 kW AC, so three hours can deliver
+        # 7.0 x 3 x 0.92 = 19.3 kWh at best, whatever the charger and the site allow. (C1) cannot
+        # hold, the LP is re-solved with it soft, and the tick reports "relaxed" with about
+        # 26 kWh unmet -- the honest answer this scenario exists to show.
+        events=(PlugInEvent(0, 1, "BYD Atto 3", 0.15, 0.90),),
+    ),
+    "fault_injection": Scenario(
+        name="fault_injection",
+        description="Mid-session, CP003 goes Faulted. Shows rebalancing.",
+        start_local="18:30",
+        depart_local="07:00",
+        # The evening rush again, arriving three simulated minutes apart so the fault comes soon
+        # after the last car. The six cars want 46.8 kW together and the site allows 40, so the
+        # plan is site-limited; CP003 (the 11 kW MG ZS EV) going Faulted at 18:55 leaves 35.8 kW
+        # of demand under the same 40 kW, and the next tick gives the five others what it freed.
+        events=(
+            PlugInEvent(0, 1, "Tata Nexon EV", 0.30, 0.80),
+            PlugInEvent(3, 2, "Tata Tiago EV", 0.25, 0.80),
+            PlugInEvent(6, 3, "MG ZS EV", 0.35, 0.80),
+            PlugInEvent(9, 4, "Mahindra XUV400", 0.20, 0.80),
+            PlugInEvent(12, 5, "BYD Atto 3", 0.40, 0.80),
+            PlugInEvent(15, 6, "Hyundai Kona", 0.30, 0.80),
+        ),
+        fault=FaultEvent(25, 3),  # charger 3 is CP003
     ),
 }
 
@@ -127,6 +200,13 @@ _RETRYABLE_PGCODES = frozenset({"55P03", "40P01"})  # lock_not_available, deadlo
 PLUG_IN_RETRY_WINDOW_S = 3.0
 PLUG_IN_RETRY_DELAY_S = 0.5
 
+# Fault injection (Scenario.fault).
+FAULT_MESSAGE_ID = "SimFault"  # DataTransfer messageId the simulated charge point faults on
+FAULT_CALL_TIMEOUT_S = 5.0  # how long the charge point has to answer that DataTransfer
+FAULT_CONFIRM_TIMEOUT_S = 5.0  # and to report Faulted afterwards
+FAULT_POLL_INTERVAL_S = 0.1  # how often the charger's status is read while waiting for it
+FAULTED = ChargePointStatus.faulted.value
+
 SESSION_ACTIVE = "active"  # Session.status of a session in progress
 SECONDS_PER_MINUTE = 60
 SECONDS_PER_HOUR = 3600
@@ -143,6 +223,7 @@ EVENT_PENDING = "pending"
 EVENT_PLUGGED_IN = "plugged_in"
 EVENT_FAILED = "failed"
 EVENT_SKIPPED = "skipped"
+EVENT_FAULTED = "faulted"  # the fault only: the charger reported Faulted
 
 
 class UnknownScenarioError(KeyError):
@@ -413,6 +494,7 @@ async def perform_reset() -> dict[str, Any]:
 class _ScenarioRun:
     scenario: Scenario
     events: list[dict[str, Any]]
+    fault: dict[str, Any] | None = None  # the fault's record, for a scenario that has one
     step: int = 0
     running: bool = True
     error: str | None = None
@@ -424,6 +506,7 @@ class _ScenarioRun:
             "step": self.step,
             "total_steps": len(self.scenario.events),
             "events": [dict(event) for event in self.events],
+            "fault": dict(self.fault) if self.fault is not None else None,
             "error": self.error,
         }
 
@@ -444,9 +527,9 @@ def is_running() -> bool:
 
 
 def scenario_status() -> dict[str, Any]:
-    """GET /api/demo/status: ``{"scenario", "running", "step", "total_steps", "events",
+    """GET /api/demo/status: ``{"scenario", "running", "step", "total_steps", "events", "fault",
     "error"}``. ``step`` counts the plug-ins done; each event records its schedule and, once
-    done, the session it created."""
+    done, the session it created. ``fault`` is null unless the scenario injects one."""
     if _run is None:
         return {
             "scenario": None,
@@ -454,6 +537,7 @@ def scenario_status() -> dict[str, Any]:
             "step": 0,
             "total_steps": 0,
             "events": [],
+            "fault": None,
             "error": None,
         }
     status = _run.snapshot()
@@ -484,7 +568,21 @@ def _new_run(scenario: Scenario, start: datetime) -> _ScenarioRun:
                 "detail": None,
             }
         )
-    return _ScenarioRun(scenario=scenario, events=events)
+    fault = None
+    if scenario.fault is not None:
+        due = start + timedelta(minutes=scenario.fault.offset_min)
+        fault = {
+            "offset_min": scenario.fault.offset_min,
+            "scheduled_at": due.isoformat(),
+            "local_time": _local_hhmm(due),
+            "charger_id": scenario.fault.charger_id,
+            "status": EVENT_PENDING,
+            "requested_at": None,
+            "ocpp_id": None,
+            "charger_status": None,
+            "detail": None,
+        }
+    return _ScenarioRun(scenario=scenario, events=events, fault=fault)
 
 
 async def _plug_in(event: PlugInEvent, depart_local: str, record: dict[str, Any]) -> dict:
@@ -518,6 +616,93 @@ async def _plug_in(event: PlugInEvent, depart_local: str, record: dict[str, Any]
             await asyncio.sleep(PLUG_IN_RETRY_DELAY_S)
 
 
+def _db_charger(charger_id: int) -> tuple[str, str] | None:
+    """(ocpp_id, status) of the charger, or None when there is no such charger."""
+    with SessionLocal() as db:
+        row = db.execute(
+            select(Charger.ocpp_id, Charger.status).where(Charger.id == charger_id)
+        ).first()
+    return (row[0], row[1]) if row is not None else None
+
+
+async def _wait_for_faulted(charger_id: int) -> str | None:
+    """Wait until the charger reports Faulted, for at most FAULT_CONFIRM_TIMEOUT_S; returns the
+    status last read (the charge point sends its StatusNotification after answering the fault)."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + FAULT_CONFIRM_TIMEOUT_S
+    while True:
+        charger = await asyncio.to_thread(_db_charger, charger_id)
+        status = charger[1] if charger is not None else None
+        remaining = deadline - loop.time()
+        if status == FAULTED or remaining <= 0:
+            return status
+        await asyncio.sleep(min(FAULT_POLL_INTERVAL_S, remaining))
+
+
+async def _inject_fault(fault: FaultEvent, record: dict[str, Any]) -> None:
+    """Send the fault to the charger's charge point and wait for the Faulted status it reports.
+
+    The charge point answers the DataTransfer, drops its power to 0 kW and sends
+    StatusNotification(Faulted); the CSMS handler stores that status and asks the orchestrator for
+    the re-plan, so none is requested here. ``record`` gets what the charge point answered.
+    Raises RuntimeError when the fault could not be delivered or was not reported back.
+    """
+    record["requested_at"] = clock.now().isoformat()
+    charger = await asyncio.to_thread(_db_charger, fault.charger_id)
+    if charger is None:
+        raise RuntimeError(f"Charger {fault.charger_id} not found")
+    ocpp_id = charger[0]
+    record["ocpp_id"] = ocpp_id
+    conn = registry.get(ocpp_id)
+    if conn is None:
+        raise RuntimeError(f"Charger {fault.charger_id} ({ocpp_id}) is not connected to the CSMS")
+    what = f"DataTransfer({PLUG_IN_VENDOR_ID}/{FAULT_MESSAGE_ID})"
+    payload = call.DataTransfer(vendor_id=PLUG_IN_VENDOR_ID, message_id=FAULT_MESSAGE_ID)
+    try:
+        result = await asyncio.wait_for(conn.cp.call(payload), FAULT_CALL_TIMEOUT_S)
+    except TimeoutError:  # asyncio.TimeoutError is TimeoutError on Python 3.11
+        raise RuntimeError(
+            f"{ocpp_id} did not answer the fault {what} within {FAULT_CALL_TIMEOUT_S:g} s"
+        ) from None
+    # suppress=True (the library's default) turns a CALLERROR answer into None.
+    status = STATUS_CALL_ERROR if result is None else str(result.status)
+    record["detail"] = f"{what} -> {status}"
+    if status != DataTransferStatus.accepted:
+        raise RuntimeError(f"{ocpp_id} answered the fault {what} with status {status!r}")
+    record["charger_status"] = await _wait_for_faulted(fault.charger_id)
+    if record["charger_status"] != FAULTED:
+        raise RuntimeError(
+            f"{ocpp_id} accepted the fault but is {record['charger_status']!r}, not {FAULTED!r}, "
+            f"{FAULT_CONFIRM_TIMEOUT_S:g} s later"
+        )
+
+
+async def _fault_step(run: _ScenarioRun, t0: float) -> None:
+    """Wait until the fault is due -- ``offset_min`` simulated minutes after ``t0``, the moment the
+    plug-ins are timed from too -- then inject it. A failure sets ``run.error``: this scenario IS
+    the fault, so it must not report success without it."""
+    fault, record = run.scenario.fault, run.fault
+    if fault is None or record is None:
+        return
+    loop = asyncio.get_running_loop()
+    due = t0 + clock.sim_seconds_to_real(fault.offset_min * SECONDS_PER_MINUTE)
+    delay = due - loop.time()
+    if delay > 0:
+        await asyncio.sleep(delay)
+    try:
+        await _inject_fault(fault, record)
+    except Exception as exc:
+        record["status"] = EVENT_FAILED
+        run.error = f"Fault injection on charger {fault.charger_id} failed: {describe_error(exc)}"
+        logger.error("Scenario %s: %s", run.scenario.name, run.error)
+        return
+    record["status"] = EVENT_FAULTED
+    logger.info(
+        "Scenario %s: fault injected on charger %d (%s), which now reports %s",
+        run.scenario.name, fault.charger_id, record["ocpp_id"], record["charger_status"],
+    )
+
+
 def describe_error(exc: BaseException) -> str:
     """A one-line description of an unexpected failure for ``error``. SQLAlchemy errors are
     reduced to the database driver's message."""
@@ -528,7 +713,8 @@ def describe_error(exc: BaseException) -> str:
 
 
 def _skip_pending(run: _ScenarioRun) -> None:
-    for record in run.events:
+    records = run.events if run.fault is None else [*run.events, run.fault]
+    for record in records:
         if record["status"] == EVENT_PENDING:
             record["status"] = EVENT_SKIPPED
 
@@ -580,6 +766,8 @@ async def _execute(run: _ScenarioRun, start: datetime) -> None:
             result["session_id"], record["hours_until_departure"],
         )
 
+    await _fault_step(run, t0)
+
 
 async def run_scenario(name: str) -> dict[str, Any]:
     """Run scenario ``name`` to the end: reset -> set the clock -> timed plug-ins (see the module
@@ -612,7 +800,8 @@ async def run_scenario(name: str) -> dict[str, Any]:
         if run.error is not None:
             _skip_pending(run)
     if run.error is None:
-        logger.info("Scenario %s: all %d plug-ins done", scenario.name, run.step)
+        injected = "" if run.fault is None else f", fault on charger {run.fault['charger_id']}"
+        logger.info("Scenario %s: all %d plug-ins done%s", scenario.name, run.step, injected)
     return run.snapshot()
 
 

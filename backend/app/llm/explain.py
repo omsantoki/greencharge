@@ -24,10 +24,12 @@ No text a user typed ever reaches this prompt: every fact value is produced here
 optimizer values, and ``language`` is mapped through a fixed table (anything unrecognised becomes
 English), so there is no free-text channel into the prompt at all.
 
-``explain_schedule()`` always returns a usable string -- with no API key, on a timeout, or after a
+``explain_schedule()`` always returns usable sentences -- with no API key, on a timeout, or after a
 failed validation it returns the deterministic explanation. The driver's "Your plan" screen waits
 for this call, so the answer and its one retry share a total budget of ``EXPLAIN_BUDGET_S``; past
-that the deterministic sentences win. No user flow ever blocks on the LLM.
+that the deterministic sentences win. No user flow ever blocks on the LLM. Which of the two wrote
+the answer travels with it as ``Explanation.llm_used``, recorded at the point the sentences are
+chosen rather than guessed afterwards, and the endpoint passes it through.
 
 English, Hindi and Gujarati, exactly like ``extract.py``.
 """
@@ -246,6 +248,21 @@ def _fmt_window(start: datetime, end: datetime) -> str:
     start_local = start.astimezone(_site_tz())
     end_local = end.astimezone(_site_tz())
     return f"{start_local:%H:%M}-{end_local:%H:%M} {end_local:%Z}"
+
+
+@dataclass(frozen=True)
+class Explanation:
+    """What ``explain_schedule()`` produced, and which of the two wrote it.
+
+    ``llm_used`` is recorded where the sentence is chosen, not guessed afterwards from the text:
+    True only on the one path that returns a model answer that passed validation, False on every
+    fallback path (no key, a failed call, a rejected answer, the budget running out). The operator
+    -- and a judge -- is entitled to know whether they are reading the model or our own canned
+    text, and this is the only place in the process that can answer that honestly.
+    """
+
+    text: str
+    llm_used: bool
 
 
 @dataclass(frozen=True)
@@ -709,8 +726,8 @@ async def explain_schedule(
     vehicle_model: str | None = None,
     language: str = "English",
     now: datetime | None = None,
-) -> str:
-    """Explain an already-computed charging plan in 2-3 sentences. Always returns a string.
+) -> Explanation:
+    """Explain an already-computed charging plan in 2-3 sentences. Always returns an answer.
 
     Everything passed in is a value this project computed elsewhere:
 
@@ -729,6 +746,10 @@ async def explain_schedule(
     ``ScheduleExplanation`` -- including the check that it invented no number. On any failure
     (no key, network down, two invalid answers) the deterministic ``fallback_text()`` is
     returned, so this call can never block or break a flow.
+
+    Returns an ``Explanation``: the sentences, and ``llm_used`` saying which of the two wrote
+    them. Both texts are equally true -- they are built from the same computed values -- but only
+    one of them came from the model.
     """
     target = normalize_language(language)
     facts = build_explain_facts(
@@ -745,7 +766,7 @@ async def explain_schedule(
         vehicle_model=vehicle_model,
         now=now,
     )
-    fallback = fallback_text(facts, target)
+    fallback = Explanation(fallback_text(facts, target), llm_used=False)
     if not is_configured():
         logger.info("No LLM key configured; using the deterministic explanation")
         return fallback
@@ -812,7 +833,7 @@ async def explain_schedule(
             logger.warning("Explanation attempt %d rejected: %s", attempt, problems)
             note = "\n\n" + _RETRY_NOTE.format(error=problems, language=target)
             continue
-        return explanation.explanation.strip()
+        return Explanation(explanation.explanation.strip(), llm_used=True)
 
     logger.warning("Explanation failed after a retry; using the deterministic explanation")
     return fallback
