@@ -12,6 +12,12 @@ they reconnect.
   creates the Session.
 - ``manual_limits_w``: session_id -> W limits set by an operator (debug set-limit, override).
   The Phase 4 orchestrator must respect them.
+- ``live_transactions``: ocpp_id -> the transaction id the charge point last reported running,
+  learned from the messages that carry one (StartTransaction, MeterValues) and dropped when it
+  ends (StopTransaction, or the connector reporting Available). It is what the CSMS knows about
+  a transaction the DATABASE may not: a restart forgets the sessions, but the charge points keep
+  their transactions (OCPP has no call that makes one forget), and the demo reset needs a
+  transaction id to stop them with. Kept across a reconnect, because the transaction is.
 - ``ocpp_log``: the most recent raw OCPP-J frames in both directions, stamped with the simulation
   clock, for the operator dashboard.
 """
@@ -42,6 +48,7 @@ registry: dict[str, ChargePointConnection] = {}
 pending_plugins: dict[str, dict] = {}
 session_waiters: dict[str, asyncio.Future] = {}
 manual_limits_w: dict[int, float] = {}
+live_transactions: dict[str, int] = {}
 ocpp_log: deque[dict] = deque(maxlen=OCPP_LOG_MAXLEN)
 
 
@@ -58,6 +65,26 @@ def unregister(ocpp_id: str) -> None:
 def get(ocpp_id: str) -> ChargePointConnection | None:
     """The live connection for ``ocpp_id``, or None when that charge point is not connected."""
     return registry.get(ocpp_id)
+
+
+def note_transaction(ocpp_id: str, transaction_id: int) -> None:
+    """Remember the transaction ``ocpp_id`` is running, from any message that carried its id."""
+    live_transactions[ocpp_id] = int(transaction_id)
+
+
+def forget_transaction(ocpp_id: str) -> None:
+    """Forget ``ocpp_id``'s transaction: it has ended. Does nothing when none was known."""
+    live_transactions.pop(ocpp_id, None)
+
+
+def transaction_of(ocpp_id: str) -> int | None:
+    """The transaction ``ocpp_id`` is running as far as the CSMS knows, or None.
+
+    Never a guess: with no id here nothing may be sent a RemoteStopTransaction, which a real
+    charge point would answer Rejected -- or, with an id that happens to exist, honour on the
+    wrong transaction.
+    """
+    return live_transactions.get(ocpp_id)
 
 
 def log_frame(direction: str, ocpp_id: str, frame: str) -> None:

@@ -9,12 +9,13 @@ Inbound (CP -> CSMS), one ``@on`` handler each:
     BootNotification    Accepted, interval = settings.heartbeat_interval_s, current time.
     Heartbeat           chargers.last_heartbeat = now; replies with the current time.
     StatusNotification  chargers.status = the reported status. Then (Phase 4): "Faulted" asks
-                        the orchestrator for a re-plan; "Available" on a connector while the
-                        charger still has an active session means the charge point has lost that
-                        transaction (e.g. the simulator restarted), so the session becomes
-                        "aborted", its manual limit is dropped and a re-plan is requested. After
-                        a normal StopTransaction the session is already completed, so the CP's
-                        Finishing -> Available changes nothing.
+                        the orchestrator for a re-plan; "Available" on a connector ends whatever
+                        transaction the CP was running (``registry.live_transactions``), and
+                        while the charger still has an active session it means the charge point
+                        has lost that transaction (e.g. the simulator restarted), so the session
+                        becomes "aborted", its manual limit is dropped and a re-plan is
+                        requested. After a normal StopTransaction the session is already
+                        completed, so the CP's Finishing -> Available changes nothing.
     StartTransaction    Creates the Session from the plug-in parameters the API left in
                         ``registry.pending_plugins``; transaction id = Session.id (also stored in
                         ``ocpp_transaction_id``). With no pending parameters the reply is
@@ -26,10 +27,14 @@ Inbound (CP -> CSMS), one ``@on`` handler each:
                         task of its own.
     MeterValues         Writes one MeterValue row and updates the session's energy_delivered_kwh
                         and soc_current (see "MeterValues" below), after attributing the energy
-                        since the previous reading (see "Accounting" below).
+                        since the previous reading (see "Accounting" below). Its transactionId is
+                        also noted in ``registry.live_transactions``, whether or not a session
+                        matches it: after a restart that is the only place the backend can learn
+                        what the charge points are still running (see the demo reset).
     StopTransaction     Attributes the last interval, then session status "completed",
                         energy_delivered_kwh = meterStop / 1000, and the session's entry in
-                        ``registry.manual_limits_w`` is dropped; then a re-plan is requested.
+                        ``registry.manual_limits_w`` and the CP's in ``live_transactions`` are
+                        dropped; then a re-plan is requested.
 
 Outbound (CSMS -> CP): ``set_charging_profile``, ``remote_stop``, ``send_plug_in``. Each returns
 the status string the charge point answered ("Accepted", "Rejected", ...), or "CallError" (the
@@ -576,6 +581,7 @@ class CentralSystemChargePoint(ChargePoint):
             status == ChargePointStatus.available
             and connector_id != MAIN_CONTROLLER_CONNECTOR_ID
         ):
+            registry.forget_transaction(self.id)  # an Available connector runs no transaction
             await self._abort_lost_sessions()
         return call_result.StatusNotification()
 
@@ -600,6 +606,7 @@ class CentralSystemChargePoint(ChargePoint):
             )
             return _start_rejected()
         self._started_session_id = session_id
+        registry.note_transaction(self.id, session_id)
         logger.info(
             "%s: StartTransaction connector %s, meter_start %s Wh, CP timestamp %s -> session "
             "and transaction %d (%s)",
@@ -645,6 +652,11 @@ class CentralSystemChargePoint(ChargePoint):
         **kwargs: Any,
     ) -> call_result.MeterValues:
         now = clock.now()
+        if transaction_id is not None:
+            # Noted before anything can drop the reading: a MeterValues whose transaction has no
+            # session here (the backend restarted) is exactly the one whose id the demo reset
+            # needs to stop that charge point with.
+            registry.note_transaction(self.id, transaction_id)
         reading = parse_meter_values(self.id, meter_value)
         # Only an energy reading is attributed; the rates are the ones at receipt time.
         rates = None if reading.energy_kwh is None else await _interval_rates(self.id, now)
@@ -661,6 +673,7 @@ class CentralSystemChargePoint(ChargePoint):
         self, meter_stop: int, timestamp: str, transaction_id: int, **kwargs: Any
     ) -> call_result.StopTransaction:
         rates = await _interval_rates(self.id, clock.now())
+        registry.forget_transaction(self.id)
         try:
             session_id = await asyncio.to_thread(
                 _db_stop_session, self.id, transaction_id, meter_stop, rates

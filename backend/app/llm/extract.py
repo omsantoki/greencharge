@@ -26,8 +26,10 @@ Structural enforcement here:
   PASSED IN (the simulation clock -- never the wall clock, which in this project is a different
   instant), and must lie inside ``MAX_DEADLINE_DAYS``;
 - on any validation failure the model is asked once more with the exact error, and if that also
-  fails the function returns ``None``. A failed extraction never blocks the driver: the UI falls
-  back to the manual form.
+  fails the function returns ``None``. A call that never reached the model (refused connection,
+  a network that swallows packets, a DNS failure, an exhausted deadline) is NOT retried: the
+  second attempt talks to the same network and waits out the same timeout to fail the same way.
+  A failed extraction never blocks the driver: the UI falls back to the manual form.
 
 The driver's message is treated as DATA, never as instructions: it is delimited, length-capped,
 and the system prompt says so. A message that tries to steer the model can still only produce a
@@ -53,11 +55,19 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
 from zoneinfo import ZoneInfo
 
+import httpx
 from pydantic import BaseModel, Field, ValidationError
 
 from app.clock import clock
 from app.config import settings
-from app.llm.client import complete, is_configured
+from app.llm.client import (
+    DEFAULT_TIMEOUT_S,
+    LlmClient,
+    LlmError,
+    complete,
+    get_client,
+    is_configured,
+)
 
 logger = logging.getLogger("greencharge.llm.extract")
 
@@ -78,6 +88,12 @@ EXTRACT_TIMEOUT_S = 30.0
 EXTRACT_BUDGET_S = 15.0
 # Less budget than this left is not worth another round trip.
 MIN_ATTEMPT_S = 0.75
+# ...and neither is a second attempt at a network that is not there. A refused connection, a
+# connect timeout (venue wifi that is "connected" but drops every packet), a DNS failure or an
+# exhausted deadline fails identically the second time, so retrying only keeps the driver watching
+# a disabled button for another connect timeout. A bad ANSWER is the opposite case -- that is what
+# the retry is for, and it still happens.
+_UNRETRYABLE_CAUSES = (httpx.ConnectError, httpx.TimeoutException, TimeoutError)
 
 _NO_CONSTRAINTS = object()
 
@@ -287,6 +303,48 @@ def _validate(payload: dict[str, Any], now: datetime) -> tuple[ExtractedConstrai
     return model, ""
 
 
+class _RecordingClient(LlmClient):
+    """The configured client, remembering why its last call failed.
+
+    ``client.complete()`` folds every failure into ``None`` -- which is what keeps the driver
+    unblocked, but also hides whether the call died on the network or on the model's answer, and
+    only one of those is worth a retry. Wrapping the client instead of calling it directly leaves
+    complete() in charge of handling and logging the failure; this only reads it.
+    """
+
+    def __init__(self, inner: LlmClient) -> None:
+        self._inner = inner
+        self.provider = inner.provider
+        self.failure: LlmError | None = None
+
+    async def generate(
+        self,
+        prompt: str,
+        *,
+        system: str | None = None,
+        json_schema: dict[str, Any] | None = None,
+        timeout_s: float = DEFAULT_TIMEOUT_S,
+    ) -> str:
+        self.failure = None
+        try:
+            return await self._inner.generate(
+                prompt, system=system, json_schema=json_schema, timeout_s=timeout_s
+            )
+        except LlmError as exc:
+            self.failure = exc
+            raise
+
+
+def _retry_is_pointless(failure: LlmError | None) -> bool:
+    """True when the failed call never reached the model: transport, not content.
+
+    The client raises a transport failure ``from`` the httpx exception underneath it, so the cause
+    is the only place the difference is visible. Everything else -- an HTTP 5xx, a safety block, a
+    body that is not JSON, an answer that fails validation -- stays retryable.
+    """
+    return failure is not None and isinstance(failure.__cause__, _UNRETRYABLE_CAUSES)
+
+
 async def extract_constraints(text: str, now: datetime) -> ExtractedConstraints | None:
     """Read a target SoC and a departure deadline out of one driver message.
 
@@ -316,6 +374,13 @@ async def extract_constraints(text: str, now: datetime) -> ExtractedConstraints 
         cleaned = cleaned[-MAX_TEXT_CHARS:]
     if not is_configured():
         logger.info("No LLM key configured; extraction skipped, the manual form takes over")
+        return None
+    try:
+        llm = _RecordingClient(get_client())
+    except LlmError as exc:
+        # is_configured() said otherwise a line ago, so this is belt and braces -- but a function
+        # the router documents as never raising must not start now.
+        logger.error("LLM client unavailable; the manual form takes over: %s", exc)
         return None
 
     now_local = now.astimezone(_site_tz())
@@ -347,6 +412,7 @@ async def extract_constraints(text: str, now: datetime) -> ExtractedConstraints 
                     # out of the reply.
                     json_schema=ExtractedConstraints.model_json_schema(),
                     timeout_s=min(EXTRACT_TIMEOUT_S, remaining),
+                    client=llm,
                 ),
                 # complete() gives up on its own timeout; this is the backstop for a provider
                 # that hangs somewhere that timeout does not cover.
@@ -359,6 +425,13 @@ async def extract_constraints(text: str, now: datetime) -> ExtractedConstraints 
             )
             return None
         if raw is None:
+            if _retry_is_pointless(llm.failure):
+                logger.warning(
+                    "Extraction attempt %d never reached the provider (%s); a retry would wait "
+                    "out the same timeout, so the manual form takes over now",
+                    attempt, type(llm.failure.__cause__).__name__,
+                )
+                return None
             logger.warning("Extraction attempt %d: the LLM call failed", attempt)
             note = ""
             continue

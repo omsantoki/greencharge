@@ -33,18 +33,37 @@ Demo reset (POST /api/demo/reset, and step 1 of every scenario), ``perform_reset
 
 1. drops every pending plug-in (``registry.pending_plugins``) and fails the futures in
    ``registry.session_waiters`` with ``PlugInError`` 409, so no new session can start;
-2. sends RemoteStopTransaction to every connected charge point with an active session, all at
-   once, and waits for the StopTransactions (and for those charge points to report Available
-   again), at most ``RESET_STOP_TIMEOUT_S`` = 3 s in total;
-3. ``TRUNCATE meter_values, schedules, sessions RESTART IDENTITY CASCADE`` -- sites, chargers and
+2. works out which charge points have to come back to Available from BOTH sides -- the active
+   sessions in the database, AND the charge points the CSMS can see are still transacting
+   without one: a connector it last saw in any state but Available, or a live transaction id in
+   ``registry.live_transactions``. That second group is what a backend restart leaves behind:
+   the charge points keep their transaction across it (a real one does too, since OCPP has no
+   call that makes one forget) while the backend that knew those sessions is gone, so a
+   reset that reconciled only with the database found nothing to stop, truncated the tables and
+   left every connector refusing the next plug-in -- for good, since no later reset could see
+   them either;
+3. sends each of them one RemoteStopTransaction and waits for the StopTransactions (and for those
+   charge points to report Available again), at most ``RESET_STOP_TIMEOUT_S`` = 3 s in total. The
+   wait keeps re-trying the two cases where nothing could be sent yet: a charge point that has
+   not reconnected, and a transaction whose id is not known yet (it arrives with that charge
+   point's next MeterValues). That is what makes a reset right after a restart work -- the charge
+   points are back within a second of the CSMS listening again, and a reset that raced them by
+   milliseconds is what wedged the demo;
+4. ``TRUNCATE meter_values, schedules, sessions RESTART IDENTITY CASCADE`` -- sites, chargers and
    grid_data (the seed data and the carbon cache) survive;
-4. clears ``registry.manual_limits_w``, ``pending_plugins`` and ``session_waiters``;
-5. waits for any orchestrator tick still in flight (it may have read sessions from before the
+5. clears ``registry.manual_limits_w``, ``pending_plugins`` and ``session_waiters``, and keeps in
+   ``live_transactions`` the transaction id of every charge point that did NOT come back: with
+   the tables gone that id is the only thing a later reset could stop it with;
+6. waits for any orchestrator tick still in flight (it may have read sessions from before the
    truncate) by running one tick on the now empty database -- for at most ``RESET_STOP_TIMEOUT_S``,
    so an unresponsive charge point cannot hold the reset up -- then ``loop.reset_state()`` (weights
    back to the defaults, no last tick, no latest schedules).
 
-The endpoint's reset (``reset_demo()``) first cancels a scenario that is still running.
+The endpoint's reset (``reset_demo()``) first cancels a scenario that is still running. A reset
+that could not bring every charge point back says so: ``"reset": false``, with the reason on the
+charge point it failed on. The tables are cleared either way, but a charge point still holding a
+transaction refuses the next plug-in, and the operator dashboard has to see that instead of a
+green line it would believe.
 
 Everything here runs on the event loop the CSMS runs on (the OCPP registry and its futures live
 there); database work runs in worker threads.
@@ -58,7 +77,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from ocpp.v16 import call
-from ocpp.v16.enums import ChargePointStatus, DataTransferStatus, RemoteStartStopStatus
+from ocpp.v16.enums import ChargePointStatus, DataTransferStatus
 from sqlalchemy import select, text
 from sqlalchemy.exc import OperationalError, SQLAlchemyError
 
@@ -214,9 +233,10 @@ SECONDS_PER_HOUR = 3600
 # Truncated in this order (children first); CASCADE covers anything else referencing sessions.
 _RESET_TABLES = (MeterValue.__tablename__, Schedule.__tablename__, Session.__tablename__)
 
-# Status strings of the per-session reset report besides the charge point's answer.
-STOP_NOT_CONNECTED = "NotConnected"
-STOP_NO_TRANSACTION = "NoTransaction"
+# Status strings of the per-charge-point reset report besides the charge point's answer.
+STOP_NOT_CONNECTED = "NotConnected"  # never (re)connected while the reset waited
+STOP_NO_TRANSACTION = "NoTransaction"  # a session in the database with no transaction id
+STOP_UNKNOWN_TRANSACTION = "UnknownTransaction"  # transacting, but its id never became known
 
 # Event statuses in GET /api/demo/status.
 EVENT_PENDING = "pending"
@@ -293,18 +313,31 @@ def _local_hhmm(ts: datetime) -> str:
 # --------------------------------------------------------------------------------------------
 
 
-@dataclass(frozen=True)
-class _ActiveSession:
-    session_id: int
+@dataclass
+class _StopTarget:
+    """One charge point the reset has to bring back to Available.
+
+    ``session_id`` is the active session the database has for it, or None for a transaction only
+    the charge point itself (and ``registry.live_transactions``) knows about -- what a backend
+    restart leaves behind. ``transaction_id`` is None while no id is known: nothing is sent then,
+    because a RemoteStopTransaction is never sent with a guessed id. ``answer`` is what the charge
+    point said, or why nothing was sent, and is reported as ``remote_stop``; the wait loop below
+    fills it in for every target, so its initial value never reaches the response.
+    """
+
+    session_id: int | None
     transaction_id: int | None
     charger_id: int
     ocpp_id: str
+    answer: str = STOP_NOT_CONNECTED
+    sent: bool = False  # one RemoteStopTransaction per target and per reset, never a second
 
 
 _reset_lock = asyncio.Lock()  # one reset at a time (endpoint and scenarios)
 
 
-def _db_active_sessions() -> list[_ActiveSession]:
+def _db_active_sessions() -> list[_StopTarget]:
+    """The sessions the database still has in progress, as targets to stop."""
     with SessionLocal() as db:
         rows = db.execute(
             select(Session.id, Session.ocpp_transaction_id, Charger.id, Charger.ocpp_id)
@@ -312,7 +345,21 @@ def _db_active_sessions() -> list[_ActiveSession]:
             .where(Session.status == SESSION_ACTIVE)
             .order_by(Session.id)
         ).all()
-    return [_ActiveSession(*row) for row in rows]
+    return [_StopTarget(*row) for row in rows]
+
+
+def _db_chargers() -> list[tuple[int, str, str]]:
+    """(id, ocpp_id, status) of every charger, in id order.
+
+    ``status`` is what the CSMS last stored from a StatusNotification, so it is how the reset
+    sees a charge point that is still transacting without a session in the database: after a
+    restart the charge points reconnect and report Charging again.
+    """
+    with SessionLocal() as db:
+        rows = db.execute(
+            select(Charger.id, Charger.ocpp_id, Charger.status).order_by(Charger.id)
+        ).all()
+    return [(row[0], row[1], row[2]) for row in rows]
 
 
 def _db_stop_progress(
@@ -382,32 +429,78 @@ def _abort_pending_plug_ins() -> None:
             waiter.add_done_callback(_mark_retrieved)
 
 
-async def _remote_stop(active: _ActiveSession, deadline: float) -> str:
-    """RemoteStopTransaction for one session; the charge point's status or why none was sent."""
-    conn = registry.get(active.ocpp_id)
+async def _collect_targets() -> list[_StopTarget]:
+    """Every charge point the reset has to bring back to Available (module docstring, step 2).
+
+    The database's active sessions, plus the charge points that are transacting without one: a
+    connector the CSMS last saw in any state but Available, or a live transaction id in
+    ``registry.live_transactions``. Connectedness is deliberately not a condition here -- the
+    reset that wedged the demo asked six charge points that reconnected nine milliseconds later,
+    and the wait below is what gives them those milliseconds. The cost is that a reset with a
+    charge point that never comes back takes the whole ``RESET_STOP_TIMEOUT_S``; it then says so
+    on that charge point, which is the truth about the demo at that moment. Everything seeds as
+    "Available", so a site whose charge points have never connected costs nothing.
+    """
+    targets = await asyncio.to_thread(_db_active_sessions)
+    have_session = {target.ocpp_id for target in targets}
+    for charger_id, ocpp_id, status in await asyncio.to_thread(_db_chargers):
+        if ocpp_id in have_session:
+            continue
+        transaction_id = registry.transaction_of(ocpp_id)
+        if transaction_id is None and status == ChargePointStatus.available.value:
+            continue
+        targets.append(_StopTarget(None, transaction_id, charger_id, ocpp_id))
+    return targets
+
+
+async def _send_stop(target: _StopTarget, deadline: float) -> None:
+    """Send this target its RemoteStopTransaction if it can take one now; record what happened.
+
+    At most one is ever sent: a charge point that answered is not asked twice, and an answer that
+    re-sending would not change is not repeated either. The retries that matter are the two where
+    nothing could be sent at all -- a charge point that has not (re)connected yet, and a
+    transaction whose id the CSMS has not learned yet -- and both are re-read here on every poll
+    of the wait loop, so a charge point that appears mid-reset is still stopped by it.
+    """
+    if target.sent:
+        return
+    conn = registry.get(target.ocpp_id)
     if conn is None:
-        return STOP_NOT_CONNECTED
-    if active.transaction_id is None:
-        return STOP_NO_TRANSACTION
+        target.answer = STOP_NOT_CONNECTED
+        return
+    if target.transaction_id is None:
+        # A transaction only the charge point knows: its id reaches the CSMS with the next
+        # MeterValues, which may well be within this reset's budget.
+        target.transaction_id = registry.transaction_of(target.ocpp_id)
+    if target.transaction_id is None:
+        target.answer = (
+            STOP_NO_TRANSACTION if target.session_id is not None else STOP_UNKNOWN_TRANSACTION
+        )
+        return
+    target.sent = True
     remaining = max(0.0, deadline - asyncio.get_running_loop().time())
     try:
-        return await asyncio.wait_for(conn.cp.remote_stop(active.transaction_id), remaining)
+        target.answer = await asyncio.wait_for(
+            conn.cp.remote_stop(target.transaction_id), remaining
+        )
     except TimeoutError:
-        return STATUS_TIMEOUT
+        target.answer = STATUS_TIMEOUT
 
 
-async def _wait_for_stops(
-    stopping: list[_ActiveSession], deadline: float
+async def _stop_and_wait(
+    targets: list[_StopTarget], deadline: float
 ) -> tuple[set[int], set[int]]:
-    """Wait until the sessions are no longer active and their chargers report Available again
-    (the simulated charge point takes a new car only then), or until ``deadline``.
+    """Stop every target, all at once, and wait until their sessions are no longer active and
+    their chargers report Available again (a charge point takes a new car only then), or until
+    ``deadline``. Every poll first gives the targets nothing could be sent to another go.
     Returns what is still outstanding: (active session ids, charger ids not Available)."""
-    if not stopping:
+    if not targets:
         return set(), set()
     loop = asyncio.get_running_loop()
-    session_ids = [a.session_id for a in stopping]
-    charger_ids = sorted({a.charger_id for a in stopping})
+    session_ids = [t.session_id for t in targets if t.session_id is not None]
+    charger_ids = sorted({t.charger_id for t in targets})
     while True:
+        await asyncio.gather(*(_send_stop(target, deadline) for target in targets))
         still_active, not_available = await asyncio.to_thread(
             _db_stop_progress, session_ids, charger_ids
         )
@@ -417,13 +510,25 @@ async def _wait_for_stops(
         await asyncio.sleep(min(RESET_POLL_INTERVAL_S, remaining))
 
 
+def _target_stopped(
+    target: _StopTarget, still_active: set[int], not_available: set[int]
+) -> bool:
+    """True when this charge point really is done: Available again, with no session of its own
+    still running. What it answered does not decide it -- an Accepted RemoteStopTransaction whose
+    StopTransaction never arrived has stopped nothing."""
+    return target.charger_id not in not_available and target.session_id not in still_active
+
+
 async def perform_reset() -> dict[str, Any]:
     """Reset all demo state (see the module docstring). Seed data and grid_data survive.
 
-    Returns ``{"reset": true, "sessions": [{"session_id", "ocpp_id", "remote_stop",
-    "stopped"}], "waited_s", "truncated"}``: every session that was active, what its charge
-    point answered to RemoteStopTransaction ("NotConnected" when it was not connected), and
-    whether its StopTransaction arrived in time. Database errors propagate.
+    Returns ``{"reset", "sessions": [{"session_id", "ocpp_id", "remote_stop", "stopped"}],
+    "waited_s", "truncated"}``: one entry per charge point that had to be brought back to
+    Available -- the session the database had for it (null for a transaction only the charge
+    point knew about), what it answered to RemoteStopTransaction ("NotConnected" when it never
+    turned up, "UnknownTransaction" when its transaction id never became known, so nothing could
+    be sent), and ``stopped``: whether it really is Available again with no session left running.
+    ``reset`` is true only when every one of them is. Database errors propagate.
     """
     async with _reset_lock:
         loop = asyncio.get_running_loop()
@@ -431,12 +536,8 @@ async def perform_reset() -> dict[str, Any]:
         deadline = started + RESET_STOP_TIMEOUT_S
 
         _abort_pending_plug_ins()
-        active = await asyncio.to_thread(_db_active_sessions)
-        answers = await asyncio.gather(*(_remote_stop(a, deadline) for a in active))
-        stopping = [
-            a for a, answer in zip(active, answers) if answer == RemoteStartStopStatus.accepted
-        ]
-        still_active, not_available = await _wait_for_stops(stopping, deadline)
+        targets = await _collect_targets()
+        still_active, not_available = await _stop_and_wait(targets, deadline)
         waited_s = loop.time() - started
         if still_active or not_available:
             logger.warning(
@@ -444,6 +545,14 @@ async def perform_reset() -> dict[str, Any]:
                 "Available; truncating anyway",
                 waited_s, sorted(still_active), sorted(not_available),
             )
+        # What the sessions table is about to stop remembering. A charge point that did not come
+        # back keeps its transaction id here, so the next reset has something to stop it with;
+        # one that did has nothing left to run.
+        for target in targets:
+            if target.charger_id not in not_available:
+                registry.forget_transaction(target.ocpp_id)
+            elif target.transaction_id is not None:
+                registry.note_transaction(target.ocpp_id, target.transaction_id)
 
         await _truncate()
         registry.manual_limits_w.clear()
@@ -462,23 +571,22 @@ async def perform_reset() -> dict[str, Any]:
             )
         orchestrator.reset_state()
 
+    stopped = [_target_stopped(t, still_active, not_available) for t in targets]
     logger.info(
-        "Demo reset: %d active session(s), %d stopped by RemoteStopTransaction in %.1f s; "
+        "Demo reset: %d charge point(s) to stop, %d back to Available in %.1f s; "
         "tables %s truncated",
-        len(active), sum(1 for a in stopping if a.session_id not in still_active), waited_s,
-        ", ".join(_RESET_TABLES),
+        len(targets), sum(stopped), waited_s, ", ".join(_RESET_TABLES),
     )
     return {
-        "reset": True,
+        "reset": all(stopped),
         "sessions": [
             {
-                "session_id": a.session_id,
-                "ocpp_id": a.ocpp_id,
-                "remote_stop": str(answer),
-                "stopped": answer == RemoteStartStopStatus.accepted
-                and a.session_id not in still_active,
+                "session_id": target.session_id,
+                "ocpp_id": target.ocpp_id,
+                "remote_stop": str(target.answer),
+                "stopped": is_stopped,
             }
-            for a, answer in zip(active, answers)
+            for target, is_stopped in zip(targets, stopped)
         ],
         "waited_s": round(waited_s, 3),
         "truncated": list(_RESET_TABLES),
