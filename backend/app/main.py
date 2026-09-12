@@ -14,6 +14,9 @@
   plans and override (`app.routers.sessions`), the site load curve (`app.routers.sites`), the
   impact summary and optimizer weights (`app.routers.impact`) and the demo controls
   (`app.routers.demo`).
+- Phase 7 LLM layer: constraint extraction, schedule explanation and the operator copilot
+  (`app.routers.llm`). It needs no startup of its own; with no API key configured every one of
+  its endpoints answers 503 and every other flow is unaffected.
 
 Tables are created idempotently at startup.
 """
@@ -28,7 +31,7 @@ from app.config import settings
 from app.db import Base, db_ok, engine
 from app.ocpp.csms import start_csms, stop_csms
 from app.orchestrator.loop import start_scheduler, stop_scheduler
-from app.routers import debug, demo, grid, impact, sessions, sites
+from app.routers import debug, demo, grid, impact, llm, sessions, sites
 
 logger = logging.getLogger("greencharge.main")
 
@@ -100,6 +103,7 @@ app.include_router(debug.router)
 app.include_router(sessions.router)
 app.include_router(impact.router)
 app.include_router(demo.router)
+app.include_router(llm.router)
 
 
 def redis_ok() -> bool:

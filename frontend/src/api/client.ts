@@ -2,11 +2,12 @@
  * Typed HTTP client for the GreenCharge backend.
  *
  * Every URL is relative ("/api/..."): Vite proxies /api to the FastAPI server, so the
- * dashboard never hard-codes a host. Every request carries a 10 s AbortSignal timeout and
- * throws `ApiError` on a non-2xx response or a network failure.
+ * dashboard never hard-codes a host. Every request carries an AbortSignal timeout — 10 s, or
+ * `LLM_REQUEST_TIMEOUT_MS` for the two endpoints that wait on a model — and throws `ApiError`
+ * on a non-2xx response or a network failure.
  *
- * The response types below mirror the live Phase 4 and Phase 6 API shapes field for field. Do not
- * add a field the backend does not send.
+ * The response types below mirror the live Phase 4, Phase 6 and Phase 7 API shapes field for
+ * field. Do not add a field the backend does not send.
  */
 
 /**
@@ -15,6 +16,14 @@
  * plug-in that hangs surfaces here as a network-error timeout rather than the server's 504).
  */
 export const REQUEST_TIMEOUT_MS = 10_000;
+
+/**
+ * The budget for the two Phase 7 endpoints that wait on a model provider. It is a hard
+ * client-side abort rather than an open-ended wait, because neither call is allowed to strand a
+ * driver: past it the plug-in form is simply filled in by hand and the plan screen keeps the
+ * deterministic explanation it renders anyway.
+ */
+export const LLM_REQUEST_TIMEOUT_MS = 15_000;
 
 /** `ApiError.status` when the request never produced an HTTP response (offline, DNS, timeout). */
 export const NETWORK_ERROR_STATUS = 0;
@@ -213,6 +222,26 @@ export type PlugInResponse = {
   ocpp_id: string;
 };
 
+/**
+ * POST /api/llm/extract — what the driver's own sentence stated, or `null` when it stated nothing
+ * readable. `target_soc` is a 0..1 fraction and `deadline_iso` carries the site's UTC offset.
+ * These two values only ever PREFILL the plug-in form; the driver checks them and submits.
+ */
+export type ExtractedConstraints = {
+  target_soc: number;
+  deadline_iso: string;
+  confidence: 'high' | 'medium' | 'low';
+  detected_language: string;
+};
+
+/**
+ * POST /api/llm/explain — one session's plan in 2-3 sentences. Narration only: every number the
+ * driver reads keeps coming from the computed fields above, never from this text.
+ */
+export type ExplainText = {
+  text: string;
+};
+
 /* ------------------------------------------------------------------ errors */
 
 /**
@@ -267,13 +296,13 @@ export function isAbortError(err: unknown): boolean {
 type Linked = { signal: AbortSignal; dispose: () => void };
 
 /**
- * A signal that aborts after REQUEST_TIMEOUT_MS, or as soon as the caller's signal does.
+ * A signal that aborts after `timeoutMs`, or as soon as the caller's signal does.
  * (AbortSignal.any is too new to rely on; this does the same job with one controller.)
  */
-function linkSignals(external?: AbortSignal): Linked {
+function linkSignals(external?: AbortSignal, timeoutMs: number = REQUEST_TIMEOUT_MS): Linked {
   const controller = new AbortController();
   const onExternalAbort = () => controller.abort();
-  const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
 
   if (external) {
     if (external.aborted) controller.abort();
@@ -289,9 +318,14 @@ function linkSignals(external?: AbortSignal): Linked {
   };
 }
 
-async function request<T>(url: string, init: RequestInit = {}, external?: AbortSignal): Promise<T> {
+async function request<T>(
+  url: string,
+  init: RequestInit = {},
+  external?: AbortSignal,
+  timeoutMs: number = REQUEST_TIMEOUT_MS,
+): Promise<T> {
   // The timeout covers reading the body too, so it is only disposed once the text is in hand.
-  const link = linkSignals(external);
+  const link = linkSignals(external, timeoutMs);
   let response: Response;
   let text: string;
 
@@ -309,7 +343,7 @@ async function request<T>(url: string, init: RequestInit = {}, external?: AbortS
       throw new ApiError(
         NETWORK_ERROR_STATUS,
         link.signal.aborted
-          ? `request timed out after ${REQUEST_TIMEOUT_MS} ms`
+          ? `request timed out after ${timeoutMs} ms`
           : err instanceof Error
             ? err.message
             : String(err),
@@ -334,7 +368,12 @@ function getJson<T>(url: string, signal?: AbortSignal): Promise<T> {
   return request<T>(url, { method: 'GET' }, signal);
 }
 
-function postJson<T>(url: string, body: unknown, signal?: AbortSignal): Promise<T> {
+function postJson<T>(
+  url: string,
+  body: unknown,
+  signal?: AbortSignal,
+  timeoutMs?: number,
+): Promise<T> {
   return request<T>(
     url,
     {
@@ -343,6 +382,7 @@ function postJson<T>(url: string, body: unknown, signal?: AbortSignal): Promise<
       body: JSON.stringify(body ?? {}),
     },
     signal,
+    timeoutMs,
   );
 }
 
@@ -442,6 +482,38 @@ export function postPlugIn(body: PlugInRequest, signal?: AbortSignal): Promise<P
   return postJson<PlugInResponse>('/api/debug/plug-in', body, signal);
 }
 
+/**
+ * The driver's own sentence (English, Hindi or Gujarati) read into the two plug-in values, or
+ * `null` when it stated neither. Extraction assists the form and never submits it, so every
+ * failure here — `null`, 503 with no key configured, or the timeout above — is answered by
+ * leaving the form exactly as the driver left it.
+ */
+export function postLlmExtract(
+  text: string,
+  signal?: AbortSignal,
+): Promise<ExtractedConstraints | null> {
+  return postJson<ExtractedConstraints | null>(
+    '/api/llm/extract',
+    { text },
+    signal,
+    LLM_REQUEST_TIMEOUT_MS,
+  );
+}
+
+/**
+ * One session's plan narrated in plain language. Always 200 with text when the LLM layer is
+ * configured (the backend falls back to deterministic sentences of its own); throws
+ * ApiError(404) for an unknown session and ApiError(503) when no key is configured.
+ */
+export function postLlmExplain(sessionId: number, signal?: AbortSignal): Promise<ExplainText> {
+  return postJson<ExplainText>(
+    '/api/llm/explain',
+    { session_id: sessionId },
+    signal,
+    LLM_REQUEST_TIMEOUT_MS,
+  );
+}
+
 /** Alias of {@link postWeights}. */
 export const setWeights = postWeights;
 /** Alias of {@link postOverride}. */
@@ -464,6 +536,8 @@ export const api = {
   getSessionImpact,
   getOverridePreview,
   postPlugIn,
+  postLlmExtract,
+  postLlmExplain,
 };
 
 export default api;

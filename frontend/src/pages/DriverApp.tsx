@@ -12,13 +12,18 @@
  *  - The clock is the SIMULATED clock from GET /api/clock, rendered in the site timezone. The
  *    browser clock is never read.
  *  - Polling goes through useLiveData at the 3 s minimum the spec allows.
+ *  - The Phase 7 model only ever assists. It PREFILLS this form from the driver's own sentence
+ *    (the driver reads the values back and submits them; extraction never submits anything) and
+ *    it narrates a plan that is already on screen. No number is ever read out of its text, and no
+ *    flow waits on it: a slow, failed or unconfigured call leaves the form fully usable and the
+ *    deterministic explanation in place.
  *  - No new dependencies, no service worker, no offline caching, no auth — Phase 6 is deliberately
  *    smaller than the operator dashboard.
  *
  * Layout is mobile-first and is built for a 390 px viewport; it simply centres on anything wider.
  */
 
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 
 import {
@@ -30,6 +35,9 @@ import {
   getSessionImpact,
   getSites,
   getVehicles,
+  isAbortError,
+  postLlmExplain,
+  postLlmExtract,
   postOverride,
   postPlugIn,
 } from '../api/client';
@@ -38,6 +46,7 @@ import type {
   CarbonPoint,
   Charger,
   ClockInfo,
+  ExtractedConstraints,
   OverridePreview,
   OverrideResponse,
   ScheduleSlot,
@@ -146,6 +155,12 @@ function fmtKwh(value: number | null): string {
 
 function fmtKw(value: number | null): string {
   return value === null ? '—' : `${value.toFixed(1)} kW`;
+}
+
+/** The language the extractor says the driver wrote in, kept to something that fits one line. */
+function languageName(value: string | undefined): string {
+  const name = String(value ?? '').trim().slice(0, 24);
+  return name === '' ? 'own' : name;
 }
 
 /** What to put in front of the driver when a request fails: the backend's reason, not a stack. */
@@ -285,10 +300,12 @@ function Banner({
   tone,
   title,
   body,
+  onDismiss,
 }: {
   tone: 'red' | 'amber' | 'green';
   title: string;
   body?: string;
+  onDismiss?: () => void;
 }) {
   const skin =
     tone === 'red'
@@ -298,8 +315,22 @@ function Banner({
         : 'border-amber-200 bg-amber-50 text-amber-800';
   return (
     <div className={`rounded-xl border px-3 py-2 text-[13px] leading-5 ${skin}`}>
-      <span className="font-semibold">{title}</span>
-      {body ? <span className="ml-1">{body}</span> : null}
+      <div className="flex items-start gap-2">
+        <p className="min-w-0 flex-1">
+          <span className="font-semibold">{title}</span>
+          {body ? <span className="ml-1">{body}</span> : null}
+        </p>
+        {onDismiss ? (
+          <button
+            type="button"
+            onClick={onDismiss}
+            aria-label="Dismiss"
+            className="-mr-1 -mt-0.5 shrink-0 px-1 text-base font-semibold leading-5 opacity-60"
+          >
+            &times;
+          </button>
+        ) : null}
+      </div>
     </div>
   );
 }
@@ -688,6 +719,15 @@ function PlugInScreen({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  // The plain-language box (Phase 7). `reading` gates nothing but its own button: the controls
+  // below stay live, and `canSubmit` never looks at it.
+  const [planText, setPlanText] = useState('');
+  const [reading, setReading] = useState(false);
+  const [understood, setUnderstood] = useState<ExtractedConstraints | null>(null);
+  const [unreadable, setUnreadable] = useState(false);
+  const readRef = useRef<AbortController | null>(null);
+  useEffect(() => () => readRef.current?.abort(), []);
+
   const available: Charger[] = useMemo(() => {
     const list = Array.isArray(sites.data) ? sites.data : [];
     const out: Charger[] = [];
@@ -727,6 +767,44 @@ function PlugInScreen({
     // that is a fact about the car, and it is what gets submitted as soc_start. Clamp the target
     // instead, so the only value the driver's drag can change is the one they are dragging.
     setTargetPct(Math.max(next, Math.min(100, socPct + 1)));
+  }
+
+  /**
+   * Read the driver's sentence into the two controls above — and nothing else. It prefills, it
+   * never submits: the driver sees both values and confirms them with Start charging.
+   *
+   * Every way this can go wrong ends in the same quiet line: null (nothing stated), 503 (no key
+   * configured), a 15 s timeout, an offline backend. The form is untouched and still usable in
+   * all of them, which is the spec's rule — a failed extraction never blocks the driver.
+   */
+  async function readPlan() {
+    const text = planText.trim();
+    if (reading || text === '') return;
+    const controller = new AbortController();
+    readRef.current?.abort();
+    readRef.current = controller;
+    setReading(true);
+    setUnreadable(false);
+    setUnderstood(null);
+    try {
+      const found = await postLlmExtract(text, controller.signal);
+      if (controller.signal.aborted) return;
+      const target = num(found?.target_soc ?? null);
+      const deadlineMs = msOf(found?.deadline_iso);
+      if (!found || target === null || !Number.isFinite(deadlineMs)) {
+        setUnreadable(true);
+        return;
+      }
+      // Through the same handler the sliders use, so the target stays above the current charge.
+      onTargetChange(clamp(Math.round(target * 100), 5, 100));
+      setDeparture(fmtTimeMs(deadlineMs));
+      setUnderstood(found);
+    } catch (err) {
+      if (isAbortError(err)) return;
+      setUnreadable(true);
+    } finally {
+      if (!controller.signal.aborted) setReading(false);
+    }
   }
 
   async function submit() {
@@ -780,6 +858,58 @@ function PlugInScreen({
         <p className="mt-0.5 text-[12px] leading-4 text-slate-500">
           Tell us when you leave and we will fit your charge into the cleanest hours before then.
         </p>
+
+        {/* Sits above the manual controls and outside the loading branch, so it is never the
+            reason the driver cannot fill this form in by hand. */}
+        <div className="mt-3">
+          <label
+            className="text-[11px] font-medium uppercase tracking-wide text-slate-500"
+            htmlFor="plan-text"
+          >
+            Say it in your own words
+          </label>
+          <input
+            id="plan-text"
+            type="text"
+            value={planText}
+            onChange={(e) => setPlanText(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') void readPlan();
+            }}
+            enterKeyHint="go"
+            placeholder="leaving at 7am, need 80% — English, हिंदी, ગુજરાતી"
+            className="mt-1 w-full rounded-xl border border-slate-300 bg-white px-3 py-2.5 text-[15px] text-slate-900"
+          />
+          <button
+            type="button"
+            disabled={reading || planText.trim() === ''}
+            onClick={() => void readPlan()}
+            className="mt-2 w-full rounded-xl border border-slate-300 bg-white px-4 py-2.5 text-[14px] font-semibold text-slate-700 disabled:text-slate-400"
+          >
+            {reading ? 'Reading…' : 'Fill in the form for me'}
+          </button>
+          {unreadable ? (
+            <p className="mt-1.5 text-[11px] text-slate-500">
+              Couldn&apos;t read that — set it below.
+            </p>
+          ) : null}
+          {understood ? (
+            <div className="mt-2">
+              <Banner
+                tone={understood.confidence === 'high' ? 'green' : 'amber'}
+                title={`Understood: ${pct(num(understood.target_soc))} by ${fmtTime(
+                  understood.deadline_iso,
+                )}.`}
+                body={`Read from your ${languageName(understood.detected_language)} message.${
+                  understood.confidence === 'high'
+                    ? ''
+                    : ' We were not certain — please check both values below.'
+                }`}
+                onDismiss={() => setUnderstood(null)}
+              />
+            </div>
+          ) : null}
+        </div>
 
         {loading ? (
           <p className="mt-3 text-sm text-slate-500">Loading chargers…</p>
@@ -938,11 +1068,13 @@ function PlanScreen({
   impact,
   forecast,
   nowIso,
+  narration,
 }: {
   session: ActiveSession;
   impact: SessionImpact | null;
   forecast: CarbonPoint[];
   nowIso: string | null;
+  narration: string | null;
 }) {
   const deadline = fmtTime(session.deadline);
   const target = pct(num(session.soc_target));
@@ -952,7 +1084,9 @@ function PlanScreen({
   const planned = hasPlan(session);
   const awaitingPlan = awaitingFirstPlan(session, impact);
 
-  // Plain language, assembled only from values the API returned. No arithmetic, no LLM.
+  // Plain language, assembled only from values the API returned. No arithmetic. These sentences
+  // are what the screen shows until POST /api/llm/explain answers, and what it keeps if that call
+  // fails, times out or is switched off — the explanation is never missing.
   const sentences: string[] = [];
   if (impact) {
     sentences.push(
@@ -1055,7 +1189,13 @@ function PlanScreen({
             hint={awaitingPlan ? 'once the plan arrives' : 'vs charging flat out'}
           />
         </div>
-        <p className="mt-2 text-[13px] leading-5 text-slate-700">{sentences.join(' ')}</p>
+        {/* The narration replaces these sentences, never the numbers: every figure on this
+            screen is still the Stat tiles' own API field, and nothing is read out of the text.
+            Before the first plan the deterministic wording stays, because that is the state whose
+            saving this screen deliberately withholds. */}
+        <p className="mt-2 text-[13px] leading-5 text-slate-700">
+          {narration !== null && !awaitingPlan ? narration : sentences.join(' ')}
+        </p>
         <p className="mt-2 text-[11px] leading-4 text-slate-500">
           Savings compare this plan with charging at full power from the moment you plugged in.
           Energy already delivered counts at the carbon intensity measured at the time; the rest of
@@ -1330,6 +1470,27 @@ function SessionScreens({
   }, [session]);
   const ended = seen && sessions.data !== null && session === null;
 
+  // The plan in plain language (Phase 7). Asked for once the optimizer has actually given this
+  // session a plan to narrate, and not on a timer: the sentences describe the shape of the plan
+  // while the numbers beside them keep coming from the 3 s poll. Every failure — 404, 503 with no
+  // key, the 15 s timeout — leaves this null, and PlanScreen keeps its own sentences.
+  const [narration, setNarration] = useState<string | null>(null);
+  const planned = session !== null && hasPlan(session);
+  useEffect(() => {
+    if (!planned) return undefined;
+    const controller = new AbortController();
+    void (async () => {
+      try {
+        const explained = await postLlmExplain(sessionId, controller.signal);
+        const text = typeof explained?.text === 'string' ? explained.text.trim() : '';
+        if (!controller.signal.aborted && text !== '') setNarration(text);
+      } catch {
+        /* the deterministic explanation stays on screen */
+      }
+    })();
+    return () => controller.abort();
+  }, [sessionId, planned]);
+
   const refreshNow = sessions.refresh;
   const refreshImpact = impact.refresh;
 
@@ -1437,6 +1598,7 @@ function SessionScreens({
           impact={impact.data}
           forecast={forecast.data ?? []}
           nowIso={clock?.now ?? null}
+          narration={narration}
         />
       ) : (
         <LiveScreen session={session} impact={impact.data} nowIso={clock?.now ?? null} />

@@ -41,5 +41,12 @@ class Settings(BaseSettings):
     tick_minutes: int = 5            # spec: "The tick — runs every 5 minutes" (SIMULATED minutes)
     soc_tolerance: float = 1e-4      # SoC travels as a 3-decimal percent string; completed-on-time check tolerance
 
+    # Phase 7: the model app/llm/client.py asks when llm_provider == "gemini" (env LLM_MODEL).
+    # Checked against GET /v1beta/models for this project's key: "gemini-2.0-flash" is not offered
+    # to it, so the default is the stable GA name that is. A pinned name, not an alias such as
+    # "gemini-flash-latest", so the demo cannot shift under us. Deliberately absent from
+    # .env.example, which stays exactly as the build spec pins it.
+    llm_model: str = "gemini-2.5-flash"
+
 
 settings = Settings()
