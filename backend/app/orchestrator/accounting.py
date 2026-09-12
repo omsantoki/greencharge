@@ -13,18 +13,35 @@ Energies are grid-side (what the charger draws, i.e. the Energy.Active.Import.Re
 ``impact_summary`` compares every non-aborted session with its baseline
 (``co2_baseline_g`` / ``cost_baseline_inr``, from ``baseline.simulate_baseline``):
 
-- completed: saved = baseline - actual; on time when soc_current >= soc_target -
-  settings.soc_tolerance (SoC arrives as a 3-decimal percent string).
-- active: saved = baseline - (actual so far + the remaining plan), where the remaining plan is
-  every slot of the session's latest schedule with slot_start >= floor_to_slot(now), priced at
-  kW x slot length x FORECAST carbon intensity (and x tariff price). The forecast is the one the
-  optimizer planned with: the forecast points the grid provider cached in ``grid_data``, resampled
-  onto the slots with ``resample_to_slots``. On time when the last tick left the session no unmet
-  energy.
+    saved = baseline for the energy the session takes - (actual so far + the charging still planned)
+
+- completed: nothing is planned any more, so the session takes what the meter reported.
+  On time when soc_current >= soc_target - settings.soc_tolerance (SoC arrives as a 3-decimal
+  percent string).
+- active: the charging still planned comes from the session's latest schedule
+  (``_remaining_charging``), priced at grid kWh x FORECAST carbon intensity (and x tariff price).
+  The forecast is the one the optimizer planned with: the forecast points the grid provider cached
+  in ``grid_data``, resampled onto the slots with ``resample_to_slots``. On time when the last tick
+  left the session no unmet energy.
+
+Two rules keep that figure honest, and steady between polls. BOTH matter: without them a session
+the optimizer cannot fill by its deadline swings between "saved" and "cost more" every few
+seconds, because the measured side and the planned side move on different clocks.
+
+1. Like for like (``baseline.baseline_tail``). The baseline is the naive charge cut down to the
+   grid energy the session actually takes -- what the meter has reported plus what is still
+   planned. A session that takes everything it asked for takes exactly the naive charge's energy,
+   so its stored baseline is used unchanged; one that takes less (its plan cannot reach the target
+   by the deadline, or it was unplugged early) is compared with a naive charge of the same size
+   instead of being credited for energy no car ever accepted.
+2. Measured and planned must tile the session once (``_remaining_charging``): no gap, no overlap.
+   Measurement stops at the last meter reading, which is also where ``soc_current`` was last
+   written, so the two sides meet there.
 
 Savings of an active session are therefore a projection: the actual part is measured, the plan
-part is forecast. Only energy that is planned is counted, so an active session with no schedule
-yet, or with unmet energy, shows more saving than it will end with.
+part is forecast. Only energy that is planned is counted, so an active session whose plan leaves
+energy unmet will not reach its target -- it is measured against the smaller naive charge it can
+actually match, not against the one it asked for.
 
 Phase 6 adds the same numbers for ONE session, for the driver's screens:
 
@@ -56,6 +73,7 @@ from app.orchestrator.baseline import (
     COUNTED_STATUSES,
     SESSION_ACTIVE,
     SESSION_COMPLETED,
+    baseline_tail,
     step,
 )
 from app.providers import get_provider
@@ -64,6 +82,9 @@ from app.providers.tariff import price_at
 
 G_PER_KG = 1000.0
 _HOUR = timedelta(hours=1)
+# Slack when matching a meter reading's cumulative register against the session row's copy of it
+# (``_delivered_by_slot``): the two are the same float, so this only absorbs the round trip.
+ZERO_ENERGY_KWH = 1e-9
 
 
 async def actual_carbon_intensity(ts: datetime, zone: str) -> float:
@@ -154,6 +175,98 @@ def _forecast_ci(db: DbSession, zone: str, slot_starts: set[datetime]) -> dict[d
     return ci
 
 
+def _last_meter_ts_cte() -> Any:
+    """A CTE of ``(session_id, ts)``: the newest meter reading of every session that has one.
+
+    That instant is where measured accounting stops: the MeterValues handler writes
+    ``co2_actual_g``, ``cost_actual_inr``, ``energy_delivered_kwh`` and ``soc_current`` from the
+    same reading in one transaction, so all four are one consistent snapshot of the session as of
+    it, and anything after it is still to be projected.
+
+    A CTE and not a second query, for two reasons. Read in its own statement it would be a
+    different snapshot from the one the session rows come from, and a reading that lands between
+    the two makes the projection count one reading period twice -- one deeply wrong frame on the
+    scorecard whenever the timing is unlucky. And ``meter_values`` has to be locked BEFORE
+    ``sessions``: the demo reset truncates ``meter_values, schedules, sessions`` in that order, so
+    a reader that takes the two locks the other way round deadlocks with it, and the one Postgres
+    kills answers 500 in the middle of a demo. A CTE is analysed before the query body, which puts
+    the locks in the order the reset takes them.
+    """
+    return (
+        select(MeterValue.session_id, func.max(MeterValue.ts).label("ts"))
+        .group_by(MeterValue.session_id)
+        .cte("last_meter_value")
+    )
+
+
+def _remaining_charging(
+    slots: list[tuple[datetime, float]],
+    measured_to: datetime,
+    energy_needed_kwh: float,
+    efficiency: float,
+    tolerance: float,
+) -> list[tuple[datetime, float]]:
+    """What an active session's plan still has to deliver, as ``(slot_start, grid kWh)``.
+
+    ``slots`` is the session's latest plan as ``(slot_start, kW)`` pairs, earliest first, and
+    ``measured_to`` the last meter reading the session row reflects (``_last_meter_ts_cte`` for the
+    summary, ``_delivered_by_slot`` for one session) -- where measurement stops and the
+    projection has to take over, with no gap and no overlap, or the savings figure jumps every
+    time one of the two moves.
+
+    How much energy the plan still holds depends on what kind of plan it is:
+
+    - While it still covers everything the car needs, it is priced whole, wherever in the horizon
+      the optimizer put it. The tick built it from ``energy_needed`` as of ``soc_current``, which
+      was written by that same last meter reading, so the plan IS "everything after
+      ``measured_to``"; its slot boundaries say when that energy flows, not how much of it is left.
+    - Once it cannot cover it (the optimizer had to leave energy unmet) the plan stops being a
+      promise about energy and is only a description of power over time -- it charges as hard as
+      it can for as long as it can -- so it has to be read from ``measured_to``: the part of a slot
+      the meter has already covered comes off, and charging that has happened since the last
+      reading but which the plan has already moved past (it starts at the slot the last tick ran
+      in) goes back on at the plan's first-slot power, the limit the charge point is following
+      right now. Never more of that than the plan leaves the car still needing, so nothing is
+      counted twice at the moment a plan stops covering the target.
+
+      Without this a short plan loses a whole 15-minute slot the instant ``now`` crosses a slot
+      boundary while the meter catches up only once a reading period, and the two staircases beat
+      against each other: the projection swings by a slot of energy every few seconds.
+
+    Slots of 0 kW are dropped; they add nothing to any of the sums. Pure computation.
+    """
+    slot = _slot()
+    slot_hours = slot / _HOUR
+    planned = [(slot_start, kw * slot_hours) for slot_start, kw in slots if kw > 0]
+    if not planned:
+        return []
+    if sum(energy for _, energy in planned) * efficiency >= energy_needed_kwh - tolerance:
+        return planned
+
+    # A plan that is short, read as a power curve from the last meter reading.
+    curve: list[tuple[datetime, float]] = []
+    for slot_start, kw in slots:
+        if kw <= 0 or slot_start + slot <= measured_to:
+            continue
+        ahead = (slot_start + slot - max(slot_start, measured_to)) / slot
+        curve.append((slot_start, kw * slot_hours * ahead))
+    first_start, first_kw = slots[0]
+    # The tick runs every few simulated minutes, so at most one slot can be unmetered AND
+    # unplanned; more than that would mean a plan too stale to extrapolate from.
+    gap_from = max(measured_to, first_start - slot)
+    headroom = energy_needed_kwh / efficiency - sum(energy for _, energy in curve)
+    while gap_from < first_start and headroom > 0 and first_kw > 0:
+        bucket = floor_to_slot(gap_from)
+        until = min(first_start, bucket + slot)
+        energy_kwh = min(first_kw * ((until - gap_from) / _HOUR), headroom)
+        if energy_kwh > 0:
+            curve.append((bucket, energy_kwh))
+            headroom -= energy_kwh
+        gap_from = until
+    curve.sort()
+    return curve
+
+
 def impact_summary(
     db: DbSession,
     now: datetime,
@@ -165,20 +278,24 @@ def impact_summary(
     ``latest_schedules``: session id -> ``{"computed_at": dt, "slots": [(slot_start, kW)] x 96}``
     (the loop's latest plans). ``last_unmet_kwh``: session id -> unmet kWh of the last tick.
     Reads through ``db`` only. Returns EXACTLY ``{"co2_saved_kg", "cost_saved_inr",
-    "sessions_on_time", "total_sessions"}``. Raises ``ProviderError`` when an active session has
-    planned charging but no forecast is cached for its zone.
+    "sessions_on_time", "total_sessions"}``. Raises ``ProviderError`` when a session has charging
+    to price but no forecast is cached for its zone.
     """
+    # Lazy import: app/orchestrator/__init__.py explains the import cycle it avoids. The tick's
+    # own helpers are used so these numbers are the ones the orchestrator acts on.
+    from app.orchestrator import loop as orchestrator_loop
+
     now = _utc(now, "now")
     latest_schedules = latest_schedules or {}
     last_unmet_kwh = last_unmet_kwh or {}
-    remaining_from = floor_to_slot(now)
-    slot = timedelta(minutes=settings.slot_minutes)
-    slot_hours = slot / _HOUR
+    efficiency = orchestrator_loop.EFFICIENCY
 
+    last_meter = _last_meter_ts_cte()  # one snapshot with the sessions; see the helper
     rows = db.execute(
-        select(Session, Site.grid_zone)
+        select(Session, Site.grid_zone, last_meter.c.ts)
         .join(Session.charger)
         .join(Charger.site)
+        .join(last_meter, last_meter.c.session_id == Session.id, isouter=True)
         .where(Session.status.in_(COUNTED_STATUSES))
         .order_by(Session.id)
     ).all()
@@ -186,33 +303,59 @@ def impact_summary(
     co2_saved_g = 0.0
     cost_saved_inr = 0.0
     sessions_on_time = 0
-    # Active sessions: the charging still planned, as (zone, slot_start, kW), priced below.
-    remaining: list[tuple[str, datetime, float]] = []
+    # Everything to price with the forecast, as (zone, slot_start, grid kWh): the charging active
+    # sessions still plan, and the end of each session's naive charge that it never takes. Both
+    # come OFF the saving -- the first is emitted, the second was never a saving to begin with.
+    charged: list[tuple[str, datetime, float]] = []
     slots_by_zone: dict[str, set[datetime]] = defaultdict(set)
 
-    for session, zone in rows:
-        co2_saved_g += (session.co2_baseline_g or 0.0) - (session.co2_actual_g or 0.0)
-        cost_saved_inr += (session.cost_baseline_inr or 0.0) - (session.cost_actual_inr or 0.0)
+    def price_later(zone: str, priced: list[tuple[datetime, float]]) -> None:
+        for slot_start, energy_kwh in priced:
+            charged.append((zone, slot_start, energy_kwh))
+            slots_by_zone[zone].add(slot_start)
+
+    for session, zone, last_meter_ts in rows:
+        remaining: list[tuple[datetime, float]] = []
         if session.status == SESSION_COMPLETED:
             if session.soc_current >= session.soc_target - settings.soc_tolerance:
                 sessions_on_time += 1
-            continue
-        # Active.
-        if last_unmet_kwh.get(session.id, 0.0) == 0.0:
+        elif last_unmet_kwh.get(session.id, 0.0) == 0.0:
             sessions_on_time += 1
-        plan = latest_schedules.get(session.id)
-        if not plan:
+        if not (session.co2_baseline_g or session.cost_baseline_inr):
+            # A car that has just plugged in: the tick can plan it before ``on_session_started``
+            # has finished the shadow simulation, and without that reference the session would
+            # read as the whole cost of its plan lost, a single deeply negative frame on the
+            # scorecard. Nothing to compare with yet, so nothing to claim -- one tick later there
+            # is. (A stored baseline of zero means the naive charge draws nothing, and then every
+            # term below is zero anyway.)
             continue
-        for slot_start, kw in plan["slots"]:
-            slot_start = _utc(slot_start, "slot_start")
-            kw = float(kw)
-            if slot_start >= remaining_from and kw > 0:
-                remaining.append((zone, slot_start, kw))
-                slots_by_zone[zone].add(slot_start)
+        co2_saved_g += (session.co2_baseline_g or 0.0) - (session.co2_actual_g or 0.0)
+        cost_saved_inr += (session.cost_baseline_inr or 0.0) - (session.cost_actual_inr or 0.0)
+        if session.status == SESSION_ACTIVE:  # the plan says what it still has to draw
+            plan = latest_schedules.get(session.id)
+            if plan:
+                remaining = _remaining_charging(
+                    [(_utc(s, "slot_start"), float(kw)) for s, kw in plan["slots"]],
+                    # No reading yet: the register was 0 at plug-in, so measurement starts there.
+                    min(
+                        _utc(session.plugged_in_at, "plugged_in_at")
+                        if last_meter_ts is None
+                        else _utc(last_meter_ts, "meter value ts"),
+                        now,
+                    ),
+                    orchestrator_loop._energy_needed_kwh(
+                        session.soc_target, session.soc_current, session.battery_kwh
+                    ),
+                    efficiency,
+                    orchestrator_loop.ZERO_TOLERANCE,
+                )
+                price_later(zone, remaining)
+        # The naive charge is only a fair reference for the energy this session really takes.
+        takes_kwh = (session.energy_delivered_kwh or 0.0) + sum(e for _, e in remaining)
+        price_later(zone, baseline_tail(session, takes_kwh))
 
     ci_by_zone = {zone: _forecast_ci(db, zone, starts) for zone, starts in slots_by_zone.items()}
-    for zone, slot_start, kw in remaining:
-        energy_kwh = kw * slot_hours
+    for zone, slot_start, energy_kwh in charged:
         co2_saved_g -= energy_kwh * ci_by_zone[zone][slot_start]
         cost_saved_inr -= energy_kwh * price_at(slot_start)
 
@@ -255,8 +398,11 @@ def _plan_remaining(
     """The charging a plan still has ahead of it: ``(slot_start, kW)`` with
     ``slot_start >= remaining_from`` and kW > 0, earliest first.
 
-    These are exactly the slots ``impact_summary`` prices for an active session; slots of 0 kW
-    are dropped because they add nothing to any of the sums.
+    The plan as the charge point will follow it, slot by slot: what the ETA, the projected SoC and
+    the override preview reason about. Slots of 0 kW are dropped because they add nothing to any
+    of the sums. What that charging is WORTH is ``_remaining_charging``, which counts the same
+    plan in kWh from the last meter reading, so that measured and projected energy meet exactly
+    once.
     """
     if not latest_schedule:
         return []
@@ -267,15 +413,14 @@ def _plan_remaining(
     return sorted((s, kw) for s, kw in slots if s >= remaining_from and kw > 0)
 
 
-def _price_slots(
-    slots: list[tuple[datetime, float]], ci_by_slot: dict[datetime, float], slot_hours: float
+def _price_energy(
+    priced: list[tuple[datetime, float]], ci_by_slot: dict[datetime, float]
 ) -> tuple[float, float]:
-    """(gCO2, INR) of charging ``slots``, with the FORECAST carbon intensity in ``ci_by_slot``
-    and the tariff -- the way ``impact_summary`` prices an active session's remaining plan."""
+    """(gCO2, INR) of ``(slot_start, grid kWh)`` charging, with the FORECAST carbon intensity in
+    ``ci_by_slot`` and the tariff -- the way ``impact_summary`` prices everything it projects."""
     co2_g = 0.0
     cost_inr = 0.0
-    for slot_start, kw in slots:
-        energy_kwh = kw * slot_hours
+    for slot_start, energy_kwh in priced:
         co2_g += energy_kwh * ci_by_slot[slot_start]
         cost_inr += energy_kwh * price_at(slot_start)
     return co2_g, cost_inr
@@ -319,14 +464,20 @@ def _projected_soc(
     return soc
 
 
-def _delivered_by_slot(db: DbSession, session: Any) -> dict[datetime, float]:
-    """Grid-side kWh the session has drawn in each 15-minute slot, from its meter values.
+def _delivered_by_slot(db: DbSession, session: Any) -> tuple[dict[datetime, float], datetime]:
+    """Grid-side kWh the session has drawn in each 15-minute slot, and where measurement stops.
 
     Each reading closes an interval that began at the previous reading (at plug-in the register
     is 0) and the interval's energy is spread over the slots it covers in proportion to the time
     it spent in each -- the same rule the past part of ``baseline.site_load_curve`` uses, because
     a 10-minute reading period does not line up with the 15-minute slots. Slots with no energy
     are absent; the values sum to the last reading's cumulative register.
+
+    The second value is the timestamp of the newest reading the SESSION ROW already reflects --
+    the newest whose cumulative register the row's ``energy_delivered_kwh`` has reached -- or
+    ``plugged_in_at`` when there is none. A reading that landed after the row was read is left
+    out on purpose: ``_remaining_charging`` projects from this instant, and counting a reading
+    the row's ``co2_actual_g`` does not yet hold would price that period twice.
     """
     rows = db.execute(
         select(MeterValue.ts, MeterValue.energy_kwh)
@@ -337,6 +488,8 @@ def _delivered_by_slot(db: DbSession, session: Any) -> dict[datetime, float]:
     delivered: dict[datetime, float] = defaultdict(float)
     previous_ts = _utc(session.plugged_in_at, "plugged_in_at")
     previous_kwh = 0.0
+    measured_to = previous_ts
+    reflected_kwh = (session.energy_delivered_kwh or 0.0) + ZERO_ENERGY_KWH
     for row in rows:
         ts = _utc(row.ts, "meter value ts")
         energy_kwh = float(row.energy_kwh)
@@ -351,8 +504,10 @@ def _delivered_by_slot(db: DbSession, session: Any) -> dict[datetime, float]:
                 if overlap_s > 0.0:
                     delivered[slot_start] += delta_kwh * (overlap_s / span_s)
                 slot_start += slot
+        if energy_kwh <= reflected_kwh:
+            measured_to = ts
         previous_ts, previous_kwh = ts, energy_kwh
-    return dict(delivered)
+    return dict(delivered), measured_to
 
 
 def _session_horizon(session: Any) -> list[datetime]:
@@ -376,9 +531,12 @@ def session_impact(
     (``{"computed_at", "slots": [(slot_start, kW)]}`` from ``loop.get_latest_schedules()``, or
     None when it has none yet). Reads through ``db`` only; sends nothing.
 
-    Savings follow ``impact_summary`` exactly: baseline - actual for a session that is no longer
-    active, and baseline - (actual + the remaining plan priced with the cached forecast) while it
-    is active. ``eta`` is the end of the planned slot that first covers the energy still needed
+    Savings follow ``impact_summary`` exactly, applied to this session alone: the naive charge cut
+    down to the grid energy the session takes (``baseline.baseline_tail`` on what the meter has
+    reported plus what is still planned), less its measured actual, less the charging its plan
+    still has to do (``_remaining_charging``, priced with the cached forecast). A session that is
+    no longer active plans no more charging, so it is measured against a naive charge of exactly
+    the energy it drew. ``eta`` is the end of the planned slot that first covers the energy needed
     (null when the plan never covers it, and when nothing is needed any more).
     ``projected_soc_at_deadline`` runs the remaining plan through the battery model from
     ``soc_current``. ``on_time`` is that projection reaching ``soc_target`` (within
@@ -387,7 +545,10 @@ def session_impact(
     session with no plan at all is on time, exactly as ``GET /api/sessions/active`` treats a
     session the last tick did not plan. ``green_kwh``/``grey_kwh`` split the METERED energy (see
     the module docstring); they sum to what the meter has reported, which is
-    ``energy_delivered_kwh`` except for the final StopTransaction reading.
+    ``energy_delivered_kwh`` except for the final StopTransaction reading. ``co2_baseline_g`` is
+    the reference the saving was actually measured against -- the naive charge cut to this
+    session's energy -- so ``co2_baseline_g - co2_actual_g - (the planned charging)`` is
+    ``co2_saved_g``, and a session that drew nothing has neither a baseline nor a saving.
 
     Returns EXACTLY ``{"session_id", "co2_saved_g", "cost_saved_inr", "co2_actual_g",
     "co2_baseline_g", "green_kwh", "grey_kwh", "eta", "projected_soc_at_deadline", "on_time",
@@ -400,7 +561,6 @@ def session_impact(
     from app.orchestrator import loop as orchestrator_loop
 
     now = _utc(now, "now")
-    slot_hours = _slot() / _HOUR
     zone, _charger_status = _session_charger(db, session)
     efficiency = orchestrator_loop.EFFICIENCY
 
@@ -410,13 +570,34 @@ def session_impact(
     is_active = session.status == SESSION_ACTIVE
     # A session that is no longer active charges no more, so it has no remaining plan to price.
     remaining = _plan_remaining(latest_schedule, floor_to_slot(now)) if is_active else []
-    delivered_by_slot = _delivered_by_slot(db, session)
+    delivered_by_slot, measured_to = _delivered_by_slot(db, session)
     horizon = _session_horizon(session) if delivered_by_slot else []
+    # The same plan in kWh, counted from the last meter reading: what it is worth (see
+    # _remaining_charging), as against ``remaining``, which is when the power flows.
+    charging: list[tuple[datetime, float]] = []
+    if is_active and latest_schedule:
+        charging = _remaining_charging(
+            [(_utc(s, "slot_start"), float(kw)) for s, kw in latest_schedule["slots"]],
+            min(measured_to, now),
+            energy_needed_kwh,
+            efficiency,
+            orchestrator_loop.ZERO_TOLERANCE,
+        )
+    # The naive charge is only a fair reference for the energy this session really takes.
+    not_taken = baseline_tail(
+        session, (session.energy_delivered_kwh or 0.0) + sum(e for _, e in charging)
+    )
 
-    wanted = {slot_start for slot_start, _ in remaining} | set(horizon) | set(delivered_by_slot)
-    # _forecast_ci speaks for impact_summary, whose only use of the forecast is the remaining plan
-    # of ACTIVE sessions. Here it also splits the delivered energy of a session that has finished,
-    # so say what is really missing rather than repeat a reason that would not apply.
+    wanted = (
+        {slot_start for slot_start, _ in charging}
+        | {slot_start for slot_start, _ in not_taken}
+        | set(horizon)
+        | set(delivered_by_slot)
+    )
+    # _forecast_ci speaks for impact_summary, which uses the forecast for planned charging and for
+    # the naive charge a session does not take. Here it also splits the delivered energy of a
+    # session that has finished, so say what is really missing rather than repeat a reason that
+    # would not apply.
     try:
         ci_by_slot = _forecast_ci(db, zone, wanted) if wanted else {}
     except ProviderError as exc:
@@ -425,11 +606,16 @@ def session_impact(
             f"cannot be accounted for."
         ) from exc
 
-    planned_co2_g, planned_cost_inr = _price_slots(remaining, ci_by_slot, slot_hours)
-    co2_saved_g = (session.co2_baseline_g or 0.0) - (session.co2_actual_g or 0.0) - planned_co2_g
-    cost_saved_inr = (
-        (session.cost_baseline_inr or 0.0) - (session.cost_actual_inr or 0.0) - planned_cost_inr
-    )
+    planned_co2_g, planned_cost_inr = _price_energy(charging, ci_by_slot)
+    untaken_co2_g, untaken_cost_inr = _price_energy(not_taken, ci_by_slot)
+    co2_baseline_g = (session.co2_baseline_g or 0.0) - untaken_co2_g
+    cost_baseline_inr = (session.cost_baseline_inr or 0.0) - untaken_cost_inr
+    co2_saved_g = co2_baseline_g - (session.co2_actual_g or 0.0) - planned_co2_g
+    cost_saved_inr = cost_baseline_inr - (session.cost_actual_inr or 0.0) - planned_cost_inr
+    if not (session.co2_baseline_g or session.cost_baseline_inr):
+        # Just plugged in, baseline not stored yet: nothing to compare with, so nothing to claim
+        # (``impact_summary`` skips the session for the same reason, and says why).
+        co2_baseline_g = co2_saved_g = cost_saved_inr = 0.0
 
     green_kwh = 0.0
     grey_kwh = 0.0
@@ -454,7 +640,7 @@ def session_impact(
         "co2_saved_g": co2_saved_g,
         "cost_saved_inr": cost_saved_inr,
         "co2_actual_g": session.co2_actual_g or 0.0,
-        "co2_baseline_g": session.co2_baseline_g or 0.0,
+        "co2_baseline_g": co2_baseline_g,
         "green_kwh": green_kwh,
         "grey_kwh": grey_kwh,
         "eta": None if eta is None else eta.isoformat(),
@@ -524,8 +710,12 @@ def override_preview(
 
     wanted = {slot_start for slot_start, _ in max_now} | {slot_start for slot_start, _ in planned}
     ci_by_slot = _forecast_ci(db, zone, wanted) if wanted else {}
-    now_co2_g, now_cost_inr = _price_slots(max_now, ci_by_slot, slot_hours)
-    planned_co2_g, planned_cost_inr = _price_slots(planned, ci_by_slot, slot_hours)
+    now_co2_g, now_cost_inr = _price_energy(
+        [(slot_start, kw * slot_hours) for slot_start, kw in max_now], ci_by_slot
+    )
+    planned_co2_g, planned_cost_inr = _price_energy(
+        [(slot_start, kw * slot_hours) for slot_start, kw in planned], ci_by_slot
+    )
 
     tolerance = orchestrator_loop.ZERO_TOLERANCE
     eta_now = _plan_eta(max_now, energy_needed_kwh, efficiency, tolerance)

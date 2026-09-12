@@ -54,7 +54,10 @@ Demo reset (POST /api/demo/reset, and step 1 of every scenario), ``perform_reset
 5. clears ``registry.manual_limits_w``, ``pending_plugins`` and ``session_waiters``, and keeps in
    ``live_transactions`` the transaction id of every charge point that did NOT come back: with
    the tables gone that id is the only thing a later reset could stop it with;
-6. waits for any orchestrator tick still in flight (it may have read sessions from before the
+6. puts the simulation clock back to ``reset_start()`` -- 18:30 site time on today's real date,
+   where the headline scenario starts -- so that a reset ends at the same instant every time and
+   the demo state a presenter finds after it is the same every time (see ``reset_start``);
+7. waits for any orchestrator tick still in flight (it may have read sessions from before the
    truncate) by running one tick on the now empty database -- for at most ``RESET_STOP_TIMEOUT_S``,
    so an unresponsive charge point cannot hold the reset up -- then ``loop.reset_state()`` (weights
    back to the defaults, no last tick, no latest schedules).
@@ -206,6 +209,8 @@ SCENARIOS: dict[str, Scenario] = {
 RESET_STOP_TIMEOUT_S = 3.0  # contract 6b: RemoteStop + waiting for the StopTransactions, in total
 RESET_POLL_INTERVAL_S = 0.1  # how often the reset looks at the sessions it asked to stop
 RESET_TICK_REASON = "demo_reset"
+# The scenario whose start every reset puts the simulation clock back to (see reset_start()).
+RESET_CLOCK_SCENARIO = "evening_rush"
 
 # TRUNCATE needs an exclusive lock on the three tables. It gives up after this long instead of
 # queueing indefinitely behind a transaction that is itself waiting for the event loop, and is
@@ -289,6 +294,30 @@ def scenario_start(scenario: Scenario, day: date | None = None) -> datetime:
     return datetime.combine(day, _local_time(scenario.start_local), tzinfo=tz).astimezone(
         timezone.utc
     )
+
+
+def reset_start() -> datetime:
+    """The instant a demo reset puts the simulation clock back to: the start of the headline
+    scenario (``RESET_CLOCK_SCENARIO``), i.e. 18:30 site time on today's real date.
+
+    A reset has to leave the clock somewhere defined, or the demo is not repeatable. Simulated
+    time runs at TIME_SCALE (60), so it drifts a simulated hour every real minute, and everything
+    read off it drifts with it: the carbon and price curves of the horizon (both shaped by the
+    time of day), how many hours a driver who says "I leave at 7am" actually has, and therefore
+    the plan, the ETA and the savings. A reset that left the clock where the last run had carried
+    it made the same unscripted flow report "at risk, 55%, -476 gCO2" at 05:40 and "on time,
+    4.19 kg" at 10:20 -- the same script telling two opposite stories.
+
+    Why this instant and not, say, the real time of day: 18:30 is where the demo's story lives
+    (the evening peak, with the overnight carbon trough ahead of it, so a car plugged in by hand
+    straight after a reset has something to optimise into), it is the state a presenter expects
+    after pressing Reset -- the next button pressed is almost always "Evening rush", which sets
+    this very instant -- and it is the only choice that makes a bare reset and a scenario start
+    agree. The real time of day would be a different instant on every run, which is the bug.
+    TODAY's real date, for the reason ``scenario_start`` gives: the simulated date drifts, the
+    real one does not, so repeated runs stay identical.
+    """
+    return scenario_start(get_scenario(RESET_CLOCK_SCENARIO))
 
 
 def hours_until_next(hhmm: str, after: datetime) -> float:
@@ -520,7 +549,8 @@ def _target_stopped(
 
 
 async def perform_reset() -> dict[str, Any]:
-    """Reset all demo state (see the module docstring). Seed data and grid_data survive.
+    """Reset all demo state (see the module docstring). Seed data and grid_data survive, and the
+    simulation clock goes back to ``reset_start()`` (18:30 site time on today's real date).
 
     Returns ``{"reset", "sessions": [{"session_id", "ocpp_id", "remote_stop", "stopped"}],
     "waited_s", "truncated"}``: one entry per charge point that had to be brought back to
@@ -555,8 +585,19 @@ async def perform_reset() -> dict[str, Any]:
                 registry.note_transaction(target.ocpp_id, target.transaction_id)
 
         await _truncate()
+        truncated_at = loop.time()
         registry.manual_limits_w.clear()
         _abort_pending_plug_ins()
+        # The clock goes back only here, and only inside the reset lock: the tables are empty and
+        # no plug-in is in flight, so nothing is left holding a deadline derived from the time
+        # being left behind. Forward is the dangerous direction (a reset pressed before 18:30
+        # site time moves the clock forward, e.g. from a workplace_solar run), and it cannot
+        # strand a session either, because there is no session left to strand. Nothing caches
+        # "now": the grid data is keyed by timestamp, so the tick below reads the slots of the
+        # new horizon instead of the ones cached for the old one, and the tick scheduler's own
+        # interval is REAL seconds, so it keeps ticking across the jump. The charge points run
+        # clocks of their own and re-anchor to ours on their next Heartbeat.
+        clock.set_now(reset_start())
         # A tick that read the old sessions may still be running; tick() holds the orchestrator's
         # lock, so this one runs only after it and sees the empty tables. Then forget its state.
         # The wait is bounded: a charge point that stops answering can hold the tick lock for the
@@ -570,12 +611,17 @@ async def perform_reset() -> dict[str, Any]:
                 "orchestrator state anyway (its results will be discarded)", RESET_STOP_TIMEOUT_S,
             )
         orchestrator.reset_state()
+        tick_s = loop.time() - truncated_at
 
     stopped = [_target_stopped(t, still_active, not_available) for t in targets]
+    # The three phases are logged separately because only the first is this module's budget: a
+    # reset that takes seconds is nearly always waiting for TRUNCATE's exclusive lock or for the
+    # tick in flight, not for the charge points.
     logger.info(
         "Demo reset: %d charge point(s) to stop, %d back to Available in %.1f s; "
-        "tables %s truncated",
+        "tables %s truncated (stop %.2f s, truncate %.2f s, clock+tick %.2f s)",
         len(targets), sum(stopped), waited_s, ", ".join(_RESET_TABLES),
+        waited_s, truncated_at - started - waited_s, tick_s,
     )
     return {
         "reset": all(stopped),

@@ -577,7 +577,7 @@ function CarbonStrip({
             strokeWidth={2.6}
             style={{ paintOrder: 'stroke' }}
           >
-            waiting for the first plan…
+            your plan arrives at the next 5-minute tick
           </text>
         ) : null}
 
@@ -706,7 +706,7 @@ function PlugInScreen({
   onStarted,
 }: {
   clock: ClockInfo | null;
-  onStarted: (sessionId: number) => void;
+  onStarted: (started: StoredSession) => void;
 }) {
   const sites = useLiveData<Site[]>(getSites, SLOW_POLL_MS);
   const vehicles = useLiveData<Vehicle[]>(getVehicles, SLOW_POLL_MS);
@@ -737,6 +737,23 @@ function PlugInScreen({
       }
     }
     return out.sort((a, b) => String(a.ocpp_id).localeCompare(String(b.ocpp_id)));
+  }, [sites.data]);
+
+  // Only to explain an empty list: a charger with a car on it is no more pluggable than before,
+  // and nothing below this widens `available`. During a scenario every bay ends up taken, and a
+  // judge holding the phone then deserves to read why rather than a dead form.
+  const fleet = useMemo(() => {
+    const list = Array.isArray(sites.data) ? sites.data : [];
+    let connected = 0;
+    let charging = 0;
+    for (const site of list) {
+      for (const charger of site?.chargers ?? []) {
+        if (!charger?.last_heartbeat) continue;
+        connected += 1;
+        if (charger.status === 'Charging') charging += 1;
+      }
+    }
+    return { connected, charging };
   }, [sites.data]);
 
   // Keep the pickers pointed at something real without ever overriding the driver's choice.
@@ -819,7 +836,13 @@ function PlugInScreen({
         soc_target: targetPct / 100,
         hours_until_departure: hours,
       });
-      onStarted(result.session_id);
+      onStarted({
+        v: 2,
+        id: result.session_id,
+        charger_id: charger.id,
+        vehicle_model: model,
+        plugged_in_at: null,
+      });
     } catch (err) {
       // The plug-in handshake can outlive the client's 10 s request timeout while still
       // succeeding on the backend, so after a TIMEOUT (never after a refusal such as 409
@@ -837,7 +860,13 @@ function PlugInScreen({
               Math.abs((num(s.soc_start) ?? -1) - socPct / 100) < 1e-6,
           );
           if (mine) {
-            onStarted(mine.id);
+            onStarted({
+              v: 2,
+              id: mine.id,
+              charger_id: mine.charger_id,
+              vehicle_model: mine.vehicle_model,
+              plugged_in_at: mine.plugged_in_at ?? null,
+            });
             return;
           }
         } catch {
@@ -923,10 +952,21 @@ function PlugInScreen({
                 Charger
               </label>
               {available.length === 0 ? (
-                <p className="mt-1 text-[13px] leading-5 text-slate-600">
-                  No charger is free right now. A charger appears here once it is connected and
-                  reporting Available.
-                </p>
+                <div className="mt-1.5">
+                  {fleet.connected === 0 ? (
+                    <Banner
+                      tone="amber"
+                      title="No charger is reporting in."
+                      body="A charger appears here once it is connected and reporting Available."
+                    />
+                  ) : (
+                    <Banner
+                      tone="amber"
+                      title="Every charger is busy."
+                      body={`${fleet.charging} of ${fleet.connected} are charging a car right now — a demo scenario fills every bay. Reset the demo from the operator dashboard to clear them, or wait for a car to finish: a free charger appears here on its own.`}
+                    />
+                  )}
+                </div>
               ) : (
                 <select
                   id="charger"
@@ -1099,7 +1139,7 @@ function PlanScreen({
         `The plan reaches ${target} at ${fmtTime(eta)}, which is after your ${deadline} departure.`,
       );
     } else if (!planned) {
-      sentences.push('Waiting for the first plan from the optimizer…');
+      sentences.push('The optimizer replans every 5 minutes; your plan lands at the next tick.');
     } else {
       sentences.push(
         `The plan does not reach ${target} before ${deadline} — it projects ${pct(
@@ -1121,7 +1161,7 @@ function PlanScreen({
     sentences.push(
       `Your ${session.vehicle_model} is plugged into ${session.ocpp_id} and has to be at ${target} by ${deadline}.`,
     );
-    sentences.push('Waiting for the first plan from the optimizer…');
+    sentences.push('The optimizer replans every 5 minutes; your plan lands at the next tick.');
   }
 
   return (
@@ -1155,7 +1195,7 @@ function PlanScreen({
                 ? 'on the current plan'
                 : planned
                   ? 'not reached by this plan'
-                  : 'waiting for the first plan'
+                  : 'set at the next 5-minute tick'
             }
           />
         </div>
@@ -1180,13 +1220,13 @@ function PlanScreen({
             label="CO₂ saved"
             value={awaitingPlan ? '—' : fmtCo2(num(impact?.co2_saved_g ?? null))}
             tone="green"
-            hint={awaitingPlan ? 'once the plan arrives' : 'vs charging flat out'}
+            hint={awaitingPlan ? 'at the next 5-minute tick' : 'vs charging flat out'}
           />
           <Stat
             label="₹ saved"
             value={awaitingPlan ? '—' : fmtInr(num(impact?.cost_saved_inr ?? null))}
             tone="green"
-            hint={awaitingPlan ? 'once the plan arrives' : 'vs charging flat out'}
+            hint={awaitingPlan ? 'at the next 5-minute tick' : 'vs charging flat out'}
           />
         </div>
         {/* The narration replaces these sentences, never the numbers: every figure on this
@@ -1254,7 +1294,7 @@ function LiveScreen({
                 {overridden
                   ? 'override limit sent to the charger'
                   : plannedKw === null
-                    ? 'waiting for the first plan'
+                    ? 'planned at the next 5-minute tick'
                     : plannedKw > 0
                       ? 'planned for this 15-minute slot'
                       : 'paused — waiting for a cleaner slot'}
@@ -1308,13 +1348,13 @@ function LiveScreen({
             label="CO₂ saved so far"
             value={awaitingPlan ? '—' : fmtCo2(num(impact?.co2_saved_g ?? null))}
             tone="green"
-            hint={awaitingPlan ? 'once the plan arrives' : undefined}
+            hint={awaitingPlan ? 'at the next 5-minute tick' : undefined}
           />
           <Stat
             label="₹ saved so far"
             value={awaitingPlan ? '—' : fmtInr(num(impact?.cost_saved_inr ?? null))}
             tone="green"
-            hint={awaitingPlan ? 'once the plan arrives' : undefined}
+            hint={awaitingPlan ? 'at the next 5-minute tick' : undefined}
           />
           <Stat label="Emitted" value={fmtCo2(num(impact?.co2_actual_g ?? null))} />
           <Stat
@@ -1435,17 +1475,64 @@ function OverridePanel({
   );
 }
 
+/**
+ * The way out of a session that is not this phone's. A demo reset restarts session ids, so a
+ * phone can be holding an id the database has since given to somebody else's car — the check at
+ * the bottom of this file catches that on a reload, and this catches everything it cannot see.
+ * Deliberately quiet: a line of text under the override, whose first tap only explains itself.
+ */
+function StartOverLink({ onForget }: { onForget: () => void }) {
+  const [asking, setAsking] = useState(false);
+
+  if (!asking) {
+    return (
+      <button
+        type="button"
+        onClick={() => setAsking(true)}
+        className="mx-auto mt-2 block px-2 py-0.5 text-[11px] font-medium text-slate-500 underline decoration-slate-300 underline-offset-2"
+      >
+        Not your session? Start over
+      </button>
+    );
+  }
+
+  return (
+    <div className="mt-2 text-center">
+      <p className="text-[11px] leading-4 text-slate-500">
+        This only clears the session from this phone. The car keeps charging.
+      </p>
+      <div className="mt-1 flex items-center justify-center gap-5">
+        <button
+          type="button"
+          onClick={onForget}
+          className="px-1 py-0.5 text-[12px] font-semibold text-slate-700 underline underline-offset-2"
+        >
+          Start over
+        </button>
+        <button
+          type="button"
+          onClick={() => setAsking(false)}
+          className="px-1 py-0.5 text-[12px] font-semibold text-slate-500"
+        >
+          Keep it
+        </button>
+      </div>
+    </div>
+  );
+}
+
 /* ------------------------------------------------------------------ session shell */
 
 function SessionScreens({
-  sessionId,
+  stored,
   clock,
   onForget,
 }: {
-  sessionId: number;
+  stored: StoredSession;
   clock: ClockInfo | null;
   onForget: () => void;
 }) {
+  const sessionId = stored.id;
   const sessions = useLiveData<ActiveSession[]>(getActiveSessions, POLL_MS);
   const impact = useLiveData<SessionImpact>(
     useCallback((signal?: AbortSignal) => getSessionImpact(sessionId, signal), [sessionId]),
@@ -1459,7 +1546,15 @@ function SessionScreens({
   const [tab, setTab] = useState<'plan' | 'live'>('plan');
   const [override, setOverride] = useState<OverrideState>({ phase: 'idle' });
 
-  const session = (sessions.data ?? []).find((s) => s.id === sessionId) ?? null;
+  // A demo reset can hand this id to somebody else's car while the phone is still on this screen,
+  // and nothing in the poll would say so. So the check that let the session be restored is applied
+  // to every poll as well: a session that is not this phone's is not this screen's either, and it
+  // is dropped in the same breath it is noticed — no frame of a stranger's plan is ever drawn.
+  const found = (sessions.data ?? []).find((s) => s.id === sessionId) ?? null;
+  const session = found !== null && isSameSession(stored, found) ? found : null;
+  useEffect(() => {
+    if (found !== null && !isSameSession(stored, found)) onForget();
+  }, [found, stored, onForget]);
 
   // "Finished" is only claimed for a session this screen has actually seen charging: a poll that
   // lands in the moment between the plug-in POST and the session appearing must not announce the
@@ -1468,7 +1563,7 @@ function SessionScreens({
   useEffect(() => {
     if (session) setSeen(true);
   }, [session]);
-  const ended = seen && sessions.data !== null && session === null;
+  const ended = seen && sessions.data !== null && session === null && found === null;
 
   // The plan in plain language (Phase 7). Asked for once the optimizer has actually given this
   // session a plan to narrate, and not on a timer: the sentences describe the shape of the plan
@@ -1572,7 +1667,7 @@ function SessionScreens({
   const alreadyOverridden = num(session.manual_limit_w) !== null;
 
   return (
-    <div className="space-y-3 pb-28">
+    <div className="space-y-3 pb-36">
       {sessions.stale || impact.stale ? (
         <Banner tone="amber" title="Connection lost." body="Showing the last update." />
       ) : null}
@@ -1614,6 +1709,7 @@ function SessionScreens({
             onConfirm={() => void confirmOverride()}
             onCancel={() => setOverride({ phase: 'idle' })}
           />
+          <StartOverLink onForget={onForget} />
         </div>
       </div>
     </div>
@@ -1622,27 +1718,75 @@ function SessionScreens({
 
 /* ------------------------------------------------------------------ page */
 
-function readStoredSession(): number | null {
+/**
+ * What this phone remembers about the car it plugged in. The id alone is not enough to identify
+ * it: a demo reset truncates sessions with RESTART IDENTITY, so the next scenario hands session
+ * id 1 to a completely different car. `plugged_in_at` is the session's own immutable stamp (the
+ * only immutable field either endpoint returns — GET /api/sessions/{id}/impact carries none), and
+ * the charger and the car cover the seconds before the first poll can read that stamp back.
+ */
+type StoredSession = {
+  v: 2;
+  id: number;
+  charger_id: number;
+  vehicle_model: string;
+  plugged_in_at: string | null;
+};
+
+/**
+ * The record this phone stored, or null. Anything else — a bare id from an older build, a half
+ * written value — is not a claim this phone can prove, so it is treated as no session at all.
+ */
+function readStoredSession(): StoredSession | null {
   try {
     const raw = window.localStorage.getItem(STORAGE_KEY);
-    const id = raw === null ? NaN : Number(raw);
-    return Number.isFinite(id) && id > 0 ? id : null;
+    if (raw === null) return null;
+    const parsed: unknown = JSON.parse(raw);
+    if (typeof parsed !== 'object' || parsed === null) return null;
+    const record = parsed as Partial<StoredSession>;
+    const id = num(record.id);
+    if (record.v !== 2 || id === null || id <= 0) return null;
+    return {
+      v: 2,
+      id,
+      charger_id: num(record.charger_id) ?? -1,
+      vehicle_model: typeof record.vehicle_model === 'string' ? record.vehicle_model : '',
+      plugged_in_at: typeof record.plugged_in_at === 'string' ? record.plugged_in_at : null,
+    };
   } catch {
     return null;
   }
 }
 
-function writeStoredSession(id: number | null): void {
+function writeStoredSession(record: StoredSession | null): void {
   try {
-    if (id === null) window.localStorage.removeItem(STORAGE_KEY);
-    else window.localStorage.setItem(STORAGE_KEY, String(id));
+    if (record === null) window.localStorage.removeItem(STORAGE_KEY);
+    else window.localStorage.setItem(STORAGE_KEY, JSON.stringify(record));
   } catch {
     /* private mode, storage disabled — the session just does not survive a refresh */
   }
 }
 
+/**
+ * Is the session the API just returned the one this phone plugged in? The id having been reused
+ * is exactly the case this has to catch, so the id only opens the question: the plug-in stamp
+ * settles it, and until that stamp has been read back the charger and the car do.
+ */
+function isSameSession(stored: StoredSession, session: ActiveSession): boolean {
+  if (session.id !== stored.id) return false;
+  if (stored.plugged_in_at !== null) {
+    const mine = msOf(stored.plugged_in_at);
+    const theirs = msOf(session.plugged_in_at);
+    return Number.isFinite(mine) && Number.isFinite(theirs) && mine === theirs;
+  }
+  return session.charger_id === stored.charger_id && session.vehicle_model === stored.vehicle_model;
+}
+
 export default function DriverApp() {
-  const [sessionId, setSessionId] = useState<number | null>(() => readStoredSession());
+  const [stored, setStored] = useState<StoredSession | null>(() => readStoredSession());
+  // A session read back from storage is nobody's until it has been matched against the API. It
+  // starts unproven, and nothing of it — not the header, not the override — renders before then.
+  const [proven, setProven] = useState(false);
   const clock = useLiveData<ClockInfo>(getClock, POLL_MS);
 
   // Renaming the tab helps when the phone view and the operator dashboard are open side by side.
@@ -1655,15 +1799,80 @@ export default function DriverApp() {
     };
   }, []);
 
-  const start = useCallback((id: number) => {
-    writeStoredSession(id);
-    setSessionId(id);
+  const start = useCallback((started: StoredSession) => {
+    writeStoredSession(started);
+    setStored(started);
+    // This phone just created it, so there is nothing to prove — but the plug-in response carries
+    // no plug-in time, so the effect below still runs once to record it for the next reload.
+    setProven(true);
   }, []);
 
   const forget = useCallback(() => {
     writeStoredSession(null);
-    setSessionId(null);
+    setStored(null);
+    setProven(false);
   }, []);
+
+  /**
+   * The one check that stands between a stored id and somebody else's car. A demo reset truncates
+   * sessions with RESTART IDENTITY, so id 1 comes back attached to whatever the next scenario
+   * plugs in; without this the phone would open straight into that car's plan, and "I'm leaving
+   * now" would put a stranger's charger to full power.
+   *
+   * It also records the plug-in stamp of a session this phone started itself, so the next reload
+   * has an immutable field to match on instead of the charger and the car.
+   *
+   * A request that never reaches the backend proves nothing either way, so it is retried rather
+   * than treated as a mismatch: a genuine session is never dropped because the network blinked.
+   */
+  useEffect(() => {
+    if (stored === null) return undefined;
+    const needsProof = !proven;
+    const needsStamp = stored.plugged_in_at === null;
+    if (!needsProof && !needsStamp) return undefined;
+
+    const controller = new AbortController();
+    let cancelled = false;
+    let timer = 0;
+
+    const attempt = async () => {
+      try {
+        const active = await getActiveSessions(controller.signal);
+        if (cancelled) return;
+        const mine = (Array.isArray(active) ? active : []).find((s) => isSameSession(stored, s));
+        if (mine) {
+          if (needsStamp && mine.plugged_in_at) {
+            const stamped: StoredSession = { ...stored, plugged_in_at: mine.plugged_in_at };
+            writeStoredSession(stamped);
+            setStored(stamped);
+          }
+          setProven(true);
+          return;
+        }
+        // Either the id is not charging anything any more, or it is charging something this phone
+        // never plugged in. Both are somebody else's session: drop it without a word and let the
+        // driver plug in. (A session this phone started is never dropped here — it is already
+        // proven, and this pass was only trying to stamp it.)
+        if (needsProof) {
+          writeStoredSession(null);
+          setStored(null);
+        }
+      } catch (err) {
+        if (cancelled || isAbortError(err)) return;
+        timer = window.setTimeout(() => void attempt(), POLL_MS);
+      }
+    };
+
+    void attempt();
+
+    return () => {
+      cancelled = true;
+      controller.abort();
+      window.clearTimeout(timer);
+    };
+  }, [stored, proven]);
+
+  const sessionId = proven && stored !== null ? stored.id : null;
 
   return (
     <div className="min-h-screen bg-slate-100">
@@ -1692,12 +1901,19 @@ export default function DriverApp() {
           </div>
         ) : null}
 
-        {sessionId === null ? (
+        {stored === null ? (
           <PlugInScreen clock={clock.data} onStarted={start} />
+        ) : !proven ? (
+          <Card>
+            <p className="text-sm text-slate-600">Checking your charging session…</p>
+            <p className="mt-1 text-[12px] leading-4 text-slate-500">
+              Making sure the session this phone remembers is still the car you plugged in.
+            </p>
+          </Card>
         ) : (
           <SessionScreens
-            key={sessionId}
-            sessionId={sessionId}
+            key={stored.id}
+            stored={stored}
             clock={clock.data}
             onForget={forget}
           />

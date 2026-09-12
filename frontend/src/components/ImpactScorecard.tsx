@@ -26,19 +26,30 @@ function num(value: unknown): number | null {
   return typeof value === 'number' && Number.isFinite(value) ? value : null;
 }
 
+/**
+ * Zero at the precision the tile shows. A figure of -0.004 is a rounding residue, not a loss:
+ * printed straight it reads "-0" in red, which claims a deficit the site does not have.
+ */
+function snap(value: number, decimals: number): number {
+  const factor = 10 ** decimals;
+  const rounded = Math.round(value * factor) / factor;
+  return rounded === 0 ? 0 : rounded;
+}
+
 function fmtKg(value: number): string {
   const abs = Math.abs(value);
-  return abs >= 100 ? value.toFixed(0) : value.toFixed(1);
+  return abs >= 100 ? snap(value, 0).toFixed(0) : snap(value, 1).toFixed(1);
 }
 
 function fmtInr(value: number): string {
-  return Math.abs(value) >= 100 ? inr.format(value) : inrFine.format(value);
+  return Math.abs(value) >= 100 ? inr.format(snap(value, 0)) : inrFine.format(snap(value, 1));
 }
 
-function toneFor(value: number | null): string {
+function toneFor(value: number | null, decimals = 1): string {
   if (value === null) return 'text-slate-400';
-  if (value > 0) return 'text-emerald-600';
-  if (value < 0) return 'text-red-600';
+  const shown = snap(value, decimals);
+  if (shown > 0) return 'text-emerald-600';
+  if (shown < 0) return 'text-red-600';
   return 'text-slate-900';
 }
 

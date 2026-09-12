@@ -24,6 +24,10 @@ Buckets: 15-minute slots aligned with ``app.providers.base.floor_to_slot``. A bu
 grid-side energy divided by the full slot length, so ``sum(kW) * 0.25 h`` is the grid energy even
 for the partly used first and last slots.
 
+``baseline_tail`` cuts that naive charge down to the energy a session really takes, so a session
+that takes less than it asked for is compared with a naive charge of the same size rather than
+with one that delivers energy the car never accepted.
+
 All datetimes are timezone-aware; results are in UTC. A naive datetime raises ``ValueError``.
 """
 import math
@@ -240,6 +244,41 @@ def simulate_baseline(
         co2_g += energy_kwh * _curve_value(carbon_curve, index, "carbon_curve")
         cost_inr += energy_kwh * _curve_value(price_curve, index, "price_curve")
     return co2_g, cost_inr
+
+
+def baseline_tail(session: Any, keep_kwh: float) -> list[tuple[datetime, float]]:
+    """The end of ``session``'s naive charge beyond its first ``keep_kwh`` grid kWh, as
+    ``(slot_start, grid kWh)`` buckets, earliest first.
+
+    The naive charge is ``simulate_baseline``'s own profile (``baseline_power_profile`` from
+    plug-in at ``max_charge_kw``). Walking it from the start, the buckets that fall inside the
+    first ``keep_kwh`` drop out, the bucket the limit falls in keeps only the energy past it, and
+    the rest are kept whole. Empty when the naive charge delivers no more than ``keep_kwh``:
+    there is then nothing it would have done that the real session does not.
+
+    This is what keeps a savings figure a like-for-like comparison. ``simulate_baseline`` prices
+    the WHOLE naive charge, which is the right reference only for a session that takes all the
+    energy it asked for. One that takes less -- a session the optimizer cannot fill by the
+    deadline, or one that is unplugged early -- has to be compared with a naive charge stopped at
+    the same kWh; subtracting this tail from the stored baseline does exactly that, and leaves the
+    stored number untouched whenever the session does take it all (see
+    ``accounting.impact_summary``). Pure computation: never sends OCPP.
+
+    Raises ``ValueError`` for a ``keep_kwh`` that is negative or not finite.
+    """
+    if not math.isfinite(keep_kwh) or keep_kwh < 0:
+        raise ValueError(f"keep_kwh must be a finite number >= 0, got {keep_kwh!r}")
+    slot_hours = _slot() / _HOUR
+    remaining = float(keep_kwh)
+    tail: list[tuple[datetime, float]] = []
+    for slot_start, kw in _session_profile(session):
+        energy_kwh = kw * slot_hours
+        if remaining >= energy_kwh:
+            remaining -= energy_kwh
+            continue
+        tail.append((slot_start, energy_kwh - remaining))
+        remaining = 0.0
+    return tail
 
 
 # --------------------------------------------------------------------------------------------
