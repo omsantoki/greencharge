@@ -145,8 +145,15 @@ export default function OcppLog({
 
       <div className="min-h-0 flex-1 overflow-y-auto" style={{ maxHeight: scrollCapPx }}>
         {rows.length === 0 ? (
-          <p className="px-3 py-6 text-center font-mono text-xs text-slate-500">
-            No frames yet — waiting for charge points to connect.
+          <p className="space-y-1 px-3 py-6 text-center font-mono text-xs text-slate-500">
+            {/*
+              True whether the buffer was just cleared by a demo reset or no charge point has ever
+              connected: this component only receives the frames, so it cannot tell the two apart.
+              An idle site's next frame is a 30 s heartbeat, so the panel can sit here for a while
+              after a reset — it must not read as a connection failure.
+            */}
+            <span className="block text-slate-400">Log clear — no frames since it was last cleared.</span>
+            <span className="block text-slate-600">The next frames appear as the charge points report in.</span>
           </p>
         ) : (
           <ul className="divide-y divide-slate-800/70">

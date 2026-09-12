@@ -185,6 +185,17 @@ export function LoadCurve({ data, className = '' }: Props) {
   // curve is metered load in past slots and can overshoot the plan between ticks.
   const overLimit = (value: number) => Boolean(model) && value > model!.limit + 1e-6;
 
+  // A peak above the limit that no planned slot reaches did not come from the optimizer: it is
+  // metered load a charge point drew at its own rating before a schedule reached it (a charge
+  // point runs at its rating until the first SetChargingProfile). Keep it red — the site really
+  // drew it — but do not publish it under the word "optimized", which reads as the optimizer
+  // having failed. Same condition as the annotation below, so label and note always agree.
+  const unmanagedPeak =
+    Boolean(data) &&
+    Boolean(model) &&
+    overLimit(data!.optimized_peak_kw) &&
+    !overLimit(model!.plannedPeak);
+
   return (
     <section
       className={`flex h-full w-full flex-col overflow-hidden rounded-xl border border-slate-200 bg-white p-4 shadow-sm ${className}`}
@@ -194,7 +205,7 @@ export function LoadCurve({ data, className = '' }: Props) {
         {data && model ? (
           <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1 text-xs text-slate-500">
             <span>
-              Optimized peak{' '}
+              {unmanagedPeak ? 'Peak site load' : 'Optimized peak'}{' '}
               <span
                 className={`font-semibold tabular-nums ${
                   overLimit(data.optimized_peak_kw) ? 'text-red-600' : 'text-slate-900'
@@ -202,19 +213,25 @@ export function LoadCurve({ data, className = '' }: Props) {
               >
                 {kw(data.optimized_peak_kw)} kW
               </span>
-              {overLimit(data.optimized_peak_kw) && !overLimit(model.plannedPeak) ? (
+              {unmanagedPeak ? (
                 <span
                   className="ml-1 text-slate-500"
                   title={
-                    'The over-limit slot is metered, not planned. A past slot is the sum of each ' +
-                    "charger's own average over its 10-second meter samples, and because the " +
-                    'chargers sample at staggered instants that sum can land slightly above the ' +
-                    'instantaneous site load. Every planned slot is at or below the site limit.'
+                    model.plannedPeak > 0
+                      ? 'The over-limit slot is metered, not planned. A past slot is the sum of ' +
+                        "each charger's own average over its 10-second meter samples, and because " +
+                        'the chargers sample at staggered instants that sum can land slightly ' +
+                        'above the instantaneous site load. Every planned slot is at or below the ' +
+                        'site limit.'
+                      : 'The over-limit slot is metered, not planned: no schedule is in force yet, ' +
+                        'so each charge point is drawing at its own rating. The figure is real ' +
+                        'site load, not an optimized peak; it falls under the limit once the ' +
+                        'first plan reaches the chargers.'
                   }
                 >
                   {model.plannedPeak > 0
                     ? `(metered — planned peak ${kw(model.plannedPeak)} kW)`
-                    : '(metered — nothing planned ahead)'}
+                    : '(metered — no plan in force yet)'}
                 </span>
               ) : null}
             </span>
